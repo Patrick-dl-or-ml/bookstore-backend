@@ -1,0 +1,697 @@
+// server.js
+require('dotenv').config(); // 🌟 必须放在最顶端！用来读取 .env 文件里的隐藏配置
+const express = require('express');
+const mysql = require('mysql2/promise');
+const cors = require('cors');
+
+const app = express();
+app.use(cors()); // 允许跨域请求
+app.use(express.json());
+
+// 1. 配置数据库连接 (专业脱敏版：动态读取环境变量)
+const pool = mysql.createPool({
+    host: process.env.DB_HOST,
+    user: process.env.DB_USER,
+    password: process.env.DB_PASSWORD,
+    database: process.env.DB_NAME,
+    port: process.env.DB_PORT || 3306,
+    waitForConnections: true,
+    connectionLimit: 10,
+    queueLimit: 0
+});
+
+// ====== 测试数据库连接 ======
+pool.getConnection()
+    .then(connection => {
+        console.log('✅ 数据库连接成功！');
+        connection.release();
+    })
+    .catch(err => {
+        console.error('❌ 数据库连接失败：', err.message);
+    });
+
+// 2. 获取购物车列表接口
+app.get('/api/cart/:consumerId', async (req, res) => {
+    const { consumerId } = req.params;
+    try {
+        const [rows] = await pool.query(`
+            SELECT
+                sc.cart_id,
+                sc.quantity,
+                b.book_id,
+                b.book_name,
+                b.author,
+                b.price,
+                b.quality
+            FROM shopping_cart sc
+                     JOIN book b ON sc.book_id = b.book_id
+            WHERE sc.consumer_id = ?
+            ORDER BY sc.add_time DESC
+        `, [consumerId]);
+
+        res.json({ success: true, data: rows });
+    } catch (error) {
+        console.error('Database error:', error);
+        res.status(500).json({ success: false, message: 'Server error' });
+    }
+});
+
+// 启动服务器 (端口也支持云端动态分配)
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+    console.log(`🚀 Backend server is running on port ${PORT}`);
+});
+
+// ====== 在 server.js 原有的 app.get('/api/cart/:consumerId', ...) 下面添加这段 ======
+
+// 3. 获取后台订单大盘接口 (管理员视角)
+app.get('/api/admin/orders', async (req, res) => {
+    try {
+        const [rows] = await pool.query(`
+            SELECT 
+                s.sale_id, 
+                s.total_price, 
+                s.payment_status, 
+                s.delivery_status, 
+                s.order_time,
+                c.consumer_name, 
+                c.phone
+            FROM sale s
+            LEFT JOIN consumer c ON s.consumer_id = c.consumer_id
+            ORDER BY s.order_time DESC
+            LIMIT 50 -- 先展示最新50条防止卡顿
+        `);
+
+        res.json({ success: true, data: rows });
+    } catch (error) {
+        console.error('Database error:', error);
+        res.status(500).json({ success: false, message: 'Server error' });
+    }
+});
+
+// ====== 在 server.js 里面追加这段 ======
+// 4. 获取图书列表 (支持搜索、分类、且带分页功能！)
+app.get('/api/books', async (req, res) => {
+    // 默认值：如果没有传，默认查第 1 页，每页展示 8 本书
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 8;
+    const offset = (page - 1) * limit; // 计算要跳过多少条数据
+
+    const keyword = req.query.keyword;
+    const category = req.query.category;
+
+    try {
+        // 构建基础的 WHERE 条件
+        let baseSql = `
+            FROM book b 
+            LEFT JOIN category c ON b.category_id = c.category_id 
+            WHERE b.status = '上架'
+        `;
+        let params = [];
+
+        if (keyword) {
+            baseSql += ` AND (b.book_name LIKE ? OR b.author LIKE ?)`;
+            params.push(`%${keyword}%`, `%${keyword}%`);
+        }
+
+        if (category && category !== 'All') {
+            baseSql += ` AND c.category_name = ?`;
+            params.push(category);
+        }
+
+        // 🌟 核心 1：先查符合条件的总条数
+        const [countResult] = await pool.query(`SELECT COUNT(*) as total ${baseSql}`, params);
+        const total = countResult[0].total;
+
+        // 🌟 核心 2：再查当前页的具体数据 (拼上 LIMIT 和 OFFSET)
+        const dataSql = `SELECT b.*, c.category_name ${baseSql} ORDER BY b.book_id DESC LIMIT ? OFFSET ?`;
+        // 注意 params 的顺序，LIMIT 和 OFFSET 必须在最后
+        const [rows] = await pool.query(dataSql, [...params, limit, offset]);
+
+        // 把总数、当前页码一起打包丢给前端
+        res.json({
+            success: true,
+            data: rows,
+            total: total,
+            currentPage: page,
+            totalPages: Math.ceil(total / limit)
+        });
+    } catch (error) {
+        console.error('搜索/分页失败:', error);
+        res.status(500).json({ success: false, message: '服务器异常' });
+    }
+});
+
+// ====== 在 server.js 里面追加这段 ======
+
+// 5. 加入购物车接口 (POST 请求)
+app.post('/api/cart', async (req, res) => {
+    // 从前端发来的请求里拿到用户ID和图书ID
+    const { consumer_id, book_id } = req.body;
+
+    try {
+        // 先偷偷查一下：这个人的购物车里，是不是已经有这本书了？
+        const [exist] = await pool.query(
+            'SELECT cart_id, quantity FROM shopping_cart WHERE consumer_id = ? AND book_id = ?',
+            [consumer_id, book_id]
+        );
+
+        if (exist.length > 0) {
+            // 如果已经有了，数量直接 +1
+            await pool.query(
+                'UPDATE shopping_cart SET quantity = quantity + 1 WHERE cart_id = ?',
+                [exist[0].cart_id]
+            );
+        } else {
+            // 如果没有，就往购物车表里插入一条新数据
+            await pool.query(
+                'INSERT INTO shopping_cart (consumer_id, book_id, quantity) VALUES (?, ?, 1)',
+                [consumer_id, book_id]
+            );
+        }
+        res.json({ success: true, message: 'Successfully added to cart!' });
+    } catch (error) {
+        console.error('Add to cart error:', error);
+        res.status(500).json({ success: false, message: 'Server error' });
+    }
+});
+
+
+// ====== 在 server.js 里面追加这段 ======
+
+// 6. 终极结算接口 (POST 请求)
+app.post('/api/checkout', async (req, res) => {
+    const { consumer_id } = req.body;
+
+    // 开启一个专属连接，准备做“事务”操作
+    const connection = await pool.getConnection();
+
+    try {
+        await connection.beginTransaction(); // 🌟 开启事务！
+
+        // 1. 查出当前这个人购物车里的所有商品和当时的价格
+        const [cartItems] = await connection.query(`
+            SELECT sc.book_id, sc.quantity, b.price
+            FROM shopping_cart sc
+            JOIN book b ON sc.book_id = b.book_id
+            WHERE sc.consumer_id = ?
+        `, [consumer_id]);
+
+        if (cartItems.length === 0) {
+            throw new Error('Cart is empty');
+        }
+
+        // 2. 计算总价 (加上运费 10.00)
+        let subtotal = cartItems.reduce((sum, item) => sum + (item.price * item.quantity), 0);
+        let totalPrice = subtotal + 10;
+
+        // 3. 往 sale (主订单表) 里插入一条数据，模拟直接支付成功
+        const [saleResult] = await connection.query(`
+            INSERT INTO sale (consumer_id, total_price, paid_amount, payment_status, delivery_status)
+            VALUES (?, ?, ?, '已支付', '未发货') 
+        `, [consumer_id, totalPrice, totalPrice]);
+
+        const saleId = saleResult.insertId; // 拿到刚刚生成的订单号！
+
+        // 4. 循环把商品塞进 detail (订单明细表)，并且扣减库存！
+        for (const item of cartItems) {
+            // 写入明细
+            await connection.query(`
+                INSERT INTO detail (sale_id, book_id, quantity, unit_price)
+                VALUES (?, ?, ?, ?)
+            `, [saleId, item.book_id, item.quantity, item.price]);
+
+            // 扣减书本库存
+            await connection.query(`
+                UPDATE book SET stock = stock - ? WHERE book_id = ?
+            `, [item.quantity, item.book_id]);
+        }
+
+        // 5. 过河拆桥：清空这个人的购物车
+        await connection.query(`DELETE FROM shopping_cart WHERE consumer_id = ?`, [consumer_id]);
+
+        await connection.commit(); // 🌟 所有操作完美执行，提交事务！
+        res.json({ success: true, message: 'Order placed successfully!' });
+
+    } catch (error) {
+        await connection.rollback(); // 🚨 一旦中间任何一步报错，全部撤销回滚！
+        console.error('Checkout error:', error);
+        res.status(500).json({ success: false, message: error.message });
+    } finally {
+        connection.release(); // 释放连接，养成好习惯
+    }
+});
+
+
+// ====== 在 server.js 里面追加这段 ======
+
+// 7. 获取个人基本信息 (查询 consumer 表)
+app.get('/api/user/:id', async (req, res) => {
+    try {
+        const [rows] = await pool.query('SELECT * FROM consumer WHERE consumer_id = ?', [req.params.id]);
+        if (rows.length > 0) {
+            res.json({ success: true, data: rows[0] });
+        } else {
+            res.status(404).json({ success: false, message: 'User not found' });
+        }
+    } catch (error) {
+        res.status(500).json({ success: false, message: 'Server error' });
+    }
+});
+
+// 8. 获取该用户的历史订单 (查询 sale 表)
+app.get('/api/user/:id/orders', async (req, res) => {
+    try {
+        const [rows] = await pool.query(
+            'SELECT * FROM sale WHERE consumer_id = ? ORDER BY order_time DESC',
+            [req.params.id]
+        );
+        res.json({ success: true, data: rows });
+    } catch (error) {
+        res.status(500).json({ success: false, message: 'Server error' });
+    }
+});
+
+// ====== 在 server.js 里面追加这段 ======
+
+// 9. 管理员：上架新书 (POST)
+app.post('/api/admin/books', async (req, res) => {
+    const { book_name, author, isbn, price, stock, quality, category_id } = req.body;
+    try {
+        await pool.query(
+            'INSERT INTO book (book_name, author, isbn, price, stock, quality, category_id, status) VALUES (?, ?, ?, ?, ?, ?, ?, "上架")',
+            [book_name, author, isbn, price, stock, quality, category_id]
+        );
+        res.json({ success: true, message: 'Book added successfully!' });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ success: false, message: 'Failed to add book' });
+    }
+});
+
+// 10. 管理员：下架/删除图书 (DELETE)
+app.delete('/api/admin/books/:id', async (req, res) => {
+    try {
+        await pool.query('DELETE FROM book WHERE book_id = ?', [req.params.id]);
+        res.json({ success: true, message: 'Book deleted!' });
+    } catch (error) {
+        res.status(500).json({ success: false, message: 'Failed to delete book' });
+    }
+});
+
+// 11. 登录接口 (调试版)
+app.post('/api/login', async (req, res) => {
+    const { username, password, role } = req.body;
+
+    // 🌟 这一行是关键：它会在你的终端控制台打印出前端到底传了什么
+    console.log(`[Login Attempt] Role: ${role}, User: ${username}, Pass: ${password}`);
+
+    try {
+        let table = role === 'admin' ? 'admin' : 'consumer';
+        let nameField = role === 'admin' ? 'admin_name' : 'consumer_name';
+        let passField = role === 'admin' ? 'admin_pass' : 'consumer_pass';
+
+        // 打印一下最终生成的 SQL 语句，看看对不对
+        const sql = `SELECT * FROM ${table} WHERE ${nameField} = ? AND ${passField} = ?`;
+        console.log(`[Executing SQL] ${sql}`);
+
+        const [rows] = await pool.query(sql, [username, password]);
+
+        if (rows.length > 0) {
+            console.log('✅ 登录成功！');
+            const user = rows[0];
+            const idField = role === 'admin' ? 'admin_id' : 'consumer_id';
+            const nameValue = role === 'admin' ? 'admin_name' : 'consumer_name';
+
+            res.json({
+                success: true,
+                user: {
+                    id: user[idField],
+                    name: user[nameValue],
+                    role: role
+                }
+            });
+        } else {
+            console.log('❌ 账号或密码不匹配');
+            res.status(401).json({ success: false, message: '账号或密码错误' });
+        }
+    } catch (error) {
+        console.error('🚨 登录接口崩溃:', error);
+        res.status(500).json({ success: false, message: '服务器报错' });
+    }
+});
+
+// ====== 在 server.js 里面追加这段 ======
+
+// 12. 管理员：上架新书 (POST)
+app.post('/api/admin/books', async (req, res) => {
+    const { book_name, author, isbn, price, stock, quality, category_id } = req.body;
+    try {
+        // 这里的 category_id 默认为 1（一般是“未分类”或“通用”）
+        await pool.query(
+            'INSERT INTO book (book_name, author, isbn, price, stock, quality, category_id, status) VALUES (?, ?, ?, ?, ?, ?, ?, "上架")',
+            [book_name, author, isbn, price, stock, quality, category_id || 1]
+        );
+        res.json({ success: true, message: '书籍上架成功！' });
+    } catch (error) {
+        console.error('上架失败:', error);
+        res.status(500).json({ success: false, message: '上架失败，请检查字段' });
+    }
+});
+
+// 13. 管理员：删除图书 (DELETE) - 双保险终极版
+app.delete('/api/admin/books/:id', async (req, res) => {
+    const bookId = req.params.id;
+    try {
+        // 第一步：先去购物车里把关联这本书的记录清空（解除外键约束 1）
+        await pool.query('DELETE FROM shopping_cart WHERE book_id = ?', [bookId]);
+
+        // 第二步：尝试直接从数据库里彻底物理删除
+        await pool.query('DELETE FROM book WHERE book_id = ?', [bookId]);
+
+        res.json({ success: true, message: '书籍已从数据库彻底删除！' });
+    } catch (error) {
+        console.error('物理删除失败，尝试触发降级下架方案:', error);
+
+        // 如果物理删除失败（说明这本书在真实的 sale 订单表里存在，数据库拒绝删除以保全财务记录）
+        // 第三步（降级方案）：把库存设为 -1，当做“软下架”处理
+        try {
+            await pool.query('UPDATE book SET stock = -1 WHERE book_id = ?', [bookId]);
+            res.json({ success: true, message: '该书存在历史订单无法物理销毁，已强制清空库存并下架隐藏！' });
+        } catch (err2) {
+            res.status(500).json({ success: false, message: '服务器彻底罢工了，请看终端红字报错' });
+        }
+    }
+});
+
+// ====== 在 server.js 里面追加这段 ======
+
+// 14. 管理员：修改图书信息 (PUT)
+app.put('/api/admin/books/:id', async (req, res) => {
+    // 🌟 修复点 1：在这里接收前端传来的 category_id
+    const { price, stock, book_name, author, category_id } = req.body;
+
+    try {
+        await pool.query(
+            // 🌟 修复点 2：把 category_id = ? 加进 SQL 语句中
+            'UPDATE book SET book_name = ?, author = ?, price = ?, stock = ?, category_id = ? WHERE book_id = ?',
+            [book_name, author, price, stock, category_id, req.params.id]
+        );
+        res.json({ success: true, message: '图书修改成功！' });
+    } catch (error) {
+        console.error('修改失败:', error);
+        res.status(500).json({ success: false, message: '修改失败' });
+    }
+});
+
+
+// ====== 在 server.js 里面追加这段 ======
+
+// 15. 新用户注册接口 (POST)
+app.post('/api/register', async (req, res) => {
+    const { username, password, email, phone } = req.body;
+
+    try {
+        // 先检查用户名是否已经被占用了
+        const [exist] = await pool.query('SELECT * FROM consumer WHERE consumer_name = ?', [username]);
+        if (exist.length > 0) {
+            return res.status(400).json({ success: false, message: '该用户名已被注册，请换一个' });
+        }
+
+        // 插入新用户数据，初始积分为0，VIP等级为0
+        const [result] = await pool.query(
+            'INSERT INTO consumer (consumer_name, consumer_pass, email, phone, vip_level, integral) VALUES (?, ?, ?, ?, 0, 0)',
+            [username, password, email, phone]
+        );
+
+        res.json({
+            success: true,
+            message: '注册成功！',
+            // 顺便把新生成的 ID 传回去，方便前端直接登录
+            user: { id: result.insertId, name: username, role: 'user' }
+        });
+    } catch (error) {
+        console.error('注册失败:', error);
+        res.status(500).json({ success: false, message: '服务器开小差了，注册失败' });
+    }
+});
+
+// ====== 在 server.js 里面追加这两段 ======
+
+// 16. 修改购物车商品数量 (PUT)
+app.put('/api/cart/:cartId', async (req, res) => {
+    const { quantity } = req.body;
+    try {
+        if (quantity <= 0) {
+            // 如果数量减到 0，直接从购物车删除
+            await pool.query('DELETE FROM shopping_cart WHERE cart_id = ?', [req.params.cartId]);
+        } else {
+            // 否则更新数量
+            await pool.query('UPDATE shopping_cart SET quantity = ? WHERE cart_id = ?', [quantity, req.params.cartId]);
+        }
+        res.json({ success: true, message: '数量已更新' });
+    } catch (error) {
+        console.error('更新购物车失败:', error);
+        res.status(500).json({ success: false, message: '更新失败' });
+    }
+});
+
+// 17. 管理员：订单发货 (PUT)
+app.put('/api/admin/orders/:id/deliver', async (req, res) => {
+    try {
+        await pool.query("UPDATE sale SET delivery_status = '已发货' WHERE sale_id = ?", [req.params.id]);
+        res.json({ success: true, message: '发货成功！' });
+    } catch (error) {
+        console.error('发货失败:', error);
+        res.status(500).json({ success: false, message: '操作失败' });
+    }
+});
+
+// 18. 获取所有分类字典
+app.get('/api/categories', async (req, res) => {
+    try {
+        // 🌟 重点看这里：一定要把 category_id 也 SELECT 出来！
+        const [rows] = await pool.query('SELECT category_id, category_name FROM category');
+        res.json({ success: true, data: rows });
+    } catch (error) {
+        console.error('获取分类失败:', error);
+        res.status(500).json({ success: false, message: '服务器异常' });
+    }
+});
+
+// ==========================================
+// 🧑‍🤝‍🧑 客户关系管理 (Consumer Relations) 接口
+// ==========================================
+
+// 1. 获取所有客户列表
+app.get('/api/admin/consumers', async (req, res) => {
+    try {
+        // 查出 consumer 表里的所有数据，按注册时间倒序
+        const [rows] = await pool.query('SELECT * FROM consumer ORDER BY register_time DESC');
+        res.json({ success: true, data: rows });
+    } catch (error) {
+        console.error('获取客户列表失败:', error);
+        res.status(500).json({ success: false, message: '服务器异常' });
+    }
+});
+
+// 2. 获取某个客户的收货地址簿
+app.get('/api/admin/consumers/:id/addresses', async (req, res) => {
+    try {
+        // 根据 consumer_id 去 address 表里查地址
+        const [rows] = await pool.query('SELECT * FROM address WHERE consumer_id = ? ORDER BY is_default DESC', [req.params.id]);
+        res.json({ success: true, data: rows });
+    } catch (error) {
+        console.error('获取地址失败:', error);
+        res.status(500).json({ success: false, message: '服务器异常' });
+    }
+});
+
+// 3. 修改客户信息 (比如管理员手动发积分、升降 VIP)
+app.put('/api/admin/consumers/:id', async (req, res) => {
+    const { consumer_name, email, vip_level, integral } = req.body;
+    try {
+        await pool.query(
+            'UPDATE consumer SET consumer_name = ?, email = ?, vip_level = ?, integral = ? WHERE consumer_id = ?',
+            [consumer_name, email, vip_level, integral, req.params.id]
+        );
+        res.json({ success: true, message: '客户信息修改成功' });
+    } catch (error) {
+        console.error('修改客户信息失败:', error);
+        res.status(500).json({ success: false, message: '服务器异常' });
+    }
+});
+
+// ==========================================
+// 📦 订单履约中心 (Order Command Center) 接口
+// ==========================================
+
+// 1. 获取所有订单 (带分页在前端做，后端一次性返回)
+app.get('/api/admin/orders', async (req, res) => {
+    try {
+        const [rows] = await pool.query('SELECT * FROM sale ORDER BY order_time DESC');
+        res.json({ success: true, data: rows });
+    } catch (error) {
+        console.error('获取订单列表失败:', error);
+        res.status(500).json({ success: false, message: '服务器异常' });
+    }
+});
+
+// 2. 获取订单明细 (联表查询，把 book 表里的名字查出来)
+app.get('/api/admin/orders/:id/details', async (req, res) => {
+    try {
+        const [rows] = await pool.query(`
+            SELECT d.*, b.book_name, b.author 
+            FROM detail d 
+            JOIN book b ON d.book_id = b.book_id 
+            WHERE d.sale_id = ?
+        `, [req.params.id]);
+        res.json({ success: true, data: rows });
+    } catch (error) {
+        console.error('获取订单明细失败:', error);
+        res.status(500).json({ success: false, message: '服务器异常' });
+    }
+});
+
+// 3. 管理员发货 (修改物流状态)
+app.put('/api/admin/orders/:id/dispatch', async (req, res) => {
+    const { delivery_status } = req.body;
+    try {
+        // 更新发货状态，并记录发货时间
+        await pool.query(
+            'UPDATE sale SET delivery_status = ?, delivery_time = NOW() WHERE sale_id = ?',
+            [delivery_status, req.params.id]
+        );
+        res.json({ success: true, message: '发货成功' });
+    } catch (error) {
+        console.error('发货失败:', error);
+        res.status(500).json({ success: false, message: '服务器异常' });
+    }
+});
+
+// ==========================================
+// 👤 C端用户：个人中心接口 (User Profile)
+// ==========================================
+
+// 1. 获取用户的个人档案
+app.get('/api/users/:id/profile', async (req, res) => {
+    try {
+        const [rows] = await pool.query('SELECT * FROM consumer WHERE consumer_id = ?', [req.params.id]);
+        if (rows.length > 0) {
+            // 把密码剔除，保护隐私
+            const { consumer_pass, ...safeData } = rows[0];
+            res.json({ success: true, data: safeData });
+        } else {
+            res.json({ success: false, message: '用户不存在' });
+        }
+    } catch (error) {
+        console.error('获取个人信息失败:', error);
+        res.status(500).json({ success: false, message: '服务器异常' });
+    }
+});
+
+// 2. 用户修改自己的个人信息
+app.put('/api/users/:id/profile', async (req, res) => {
+    const { consumer_name, email, phone } = req.body;
+    try {
+        // C端用户只能改这三个字段，绝不能让他们自己改 vip_level 和 integral！
+        await pool.query(
+            'UPDATE consumer SET consumer_name = ?, email = ?, phone = ? WHERE consumer_id = ?',
+            [consumer_name, email, phone, req.params.id]
+        );
+        res.json({ success: true, message: '个人资料更新成功' });
+    } catch (error) {
+        console.error('更新个人信息失败:', error);
+        res.status(500).json({ success: false, message: '服务器异常' });
+    }
+});
+
+// 3. 用户查询自己的专属订单
+app.get('/api/users/:id/orders', async (req, res) => {
+    try {
+        // 只能查 consumer_id 是自己的订单
+        const [rows] = await pool.query('SELECT * FROM sale WHERE consumer_id = ? ORDER BY order_time DESC', [req.params.id]);
+        res.json({ success: true, data: rows });
+    } catch (error) {
+        console.error('获取我的订单失败:', error);
+        res.status(500).json({ success: false, message: '服务器异常' });
+    }
+});
+
+// ==========================================
+// 🏠 C端用户：地址管理接口
+// ==========================================
+
+// 1. C端用户查询自己的地址簿
+app.get('/api/users/:id/addresses', async (req, res) => {
+    try {
+        // 查自己的地址，并把默认地址 (is_default = 1) 排在最前面
+        const [rows] = await pool.query('SELECT * FROM address WHERE consumer_id = ? ORDER BY is_default DESC, address_id DESC', [req.params.id]);
+        res.json({ success: true, data: rows });
+    } catch (error) {
+        console.error('获取我的地址失败:', error);
+        res.status(500).json({ success: false, message: '服务器异常' });
+    }
+});
+
+// 2. C端用户设置默认地址
+app.put('/api/users/:id/addresses/:addressId/default', async (req, res) => {
+    const userId = req.params.id;
+    const targetAddressId = req.params.addressId;
+    const connection = await pool.getConnection(); // 需要用事务保证一致性
+
+    try {
+        await connection.beginTransaction();
+        // 第一步：把该用户的所有地址 is_default 都设为 0 (取消他现有的默认地址)
+        await connection.query('UPDATE address SET is_default = 0 WHERE consumer_id = ?', [userId]);
+        // 第二步：把他点击的那个地址 is_default 设为 1
+        await connection.query('UPDATE address SET is_default = 1 WHERE consumer_id = ? AND address_id = ?', [userId, targetAddressId]);
+
+        await connection.commit();
+        res.json({ success: true, message: '默认地址设置成功' });
+    } catch (error) {
+        await connection.rollback();
+        console.error('设置默认地址失败:', error);
+        res.status(500).json({ success: false, message: '服务器异常' });
+    } finally {
+        connection.release();
+    }
+});
+
+
+// ==========================================
+// 📊 管理员数据大盘接口 (Executive Dashboard) - 终极稳健版
+// ==========================================
+
+app.get('/api/admin/dashboard/stats', async (req, res) => {
+    try {
+        // 1. 今日数据 (拆分开查，绝对防止连表导致金额翻倍)
+        const [todayRev] = await pool.query(`SELECT SUM(total_price) AS rev FROM sale WHERE DATE(order_time) = CURDATE() AND payment_status != '未支付'`);
+        const [todayQty] = await pool.query(`SELECT SUM(d.quantity) AS qty FROM sale s JOIN detail d ON s.sale_id = d.sale_id WHERE DATE(s.order_time) = CURDATE() AND s.payment_status != '未支付'`);
+
+        // 2. 本月数据
+        const [monthRev] = await pool.query(`SELECT SUM(total_price) AS rev FROM sale WHERE YEAR(order_time) = YEAR(CURDATE()) AND MONTH(order_time) = MONTH(CURDATE()) AND payment_status != '未支付'`);
+        const [monthQty] = await pool.query(`SELECT SUM(d.quantity) AS qty FROM sale s JOIN detail d ON s.sale_id = d.sale_id WHERE YEAR(s.order_time) = YEAR(CURDATE()) AND MONTH(s.order_time) = MONTH(CURDATE()) AND s.payment_status != '未支付'`);
+
+        // 3. 基础容量
+        const [users] = await pool.query('SELECT COUNT(*) AS total FROM consumer');
+        const [books] = await pool.query('SELECT COUNT(*) AS total FROM book');
+
+        // 安全回落机制：如果查出来是 null，统一给 0
+        res.json({
+            success: true,
+            data: {
+                todayBooks: todayQty[0]?.qty || 0,
+                todayRevenue: todayRev[0]?.rev || 0,
+                monthBooks: monthQty[0]?.qty || 0,
+                monthRevenue: monthRev[0]?.rev || 0,
+                totalUsers: users[0]?.total || 0,
+                totalBooks: books[0]?.total || 0
+            }
+        });
+    } catch (error) {
+        // 加了一个超级醒目的报错日志，万一还不行，看终端红字！
+        console.error('🔥 大盘数据查询崩溃啦:', error);
+        res.status(500).json({ success: false, message: '服务器数据统计异常' });
+    }
+});
