@@ -711,7 +711,7 @@ app.get('/api/admin/dashboard/stats', async (req, res) => {
 app.get('/api/admin/inventory/warning', async (req, res) => {
     try {
         // 查找库存低于 10 本的图书[cite: 1]
-        const [rows] = await pool.query('SELECT book_id, book_name, stock FROM book WHERE stock < 10 ORDER BY stock ASC');
+        const [rows] = await pool.query('SELECT book_id, book_name, stock FROM book WHERE stock < 5 ORDER BY stock ASC');
         res.json({ success: true, data: rows });
     } catch (error) {
         res.status(500).json({ success: false, message: '获取预警失败' });
