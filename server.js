@@ -30,6 +30,11 @@ pool.getConnection()
         console.error('❌ 数据库连接失败：', err.message);
     });
 
+// 健康检查接口，专门给 UptimeRobot 敲门用
+app.get('/', (req, res) => {
+    res.status(200).send('API is awake and running!');
+});
+
 // 2. 获取购物车列表接口
 app.get('/api/cart/:consumerId', async (req, res) => {
     const { consumerId } = req.params;
@@ -179,69 +184,75 @@ app.post('/api/cart', async (req, res) => {
 
 // ====== 在 server.js 里面追加这段 ======
 
-// 6. 终极结算接口 (POST 请求)
 app.post('/api/checkout', async (req, res) => {
     const { consumer_id } = req.body;
-
-    // 开启一个专属连接，准备做“事务”操作
     const connection = await pool.getConnection();
 
     try {
-        await connection.beginTransaction(); // 🌟 开启事务！
+        await connection.beginTransaction();
 
-        // 1. 查出当前这个人购物车里的所有商品和当时的价格
+        // 1. 获取用户信息，查出 vip_level
+        const [user] = await connection.query(
+            'SELECT vip_level FROM consumer WHERE consumer_id = ?',
+            [consumer_id]
+        );
+        const level = user[0]?.vip_level || 0;
+
+        // 2. 核心折扣逻辑：硬编码折扣率 (对应文档中的会员等级)
+        let discountRate = 1.0;
+        if (level === 1) discountRate = 0.95; // 银卡 95折
+        else if (level === 2) discountRate = 0.90; // 金卡 90折
+        else if (level === 3) discountRate = 0.85; // 钻石 85折
+
+        // 3. 查出购物车商品
         const [cartItems] = await connection.query(`
             SELECT sc.book_id, sc.quantity, b.price
             FROM shopping_cart sc
-            JOIN book b ON sc.book_id = b.book_id
+                     JOIN book b ON sc.book_id = b.book_id
             WHERE sc.consumer_id = ?
         `, [consumer_id]);
 
-        if (cartItems.length === 0) {
-            throw new Error('Cart is empty');
-        }
+        if (cartItems.length === 0) throw new Error('Cart is empty');
 
-        // 2. 计算总价 (加上运费 10.00)
+        // 4. 计算金额：计算原价后再打折
         let subtotal = cartItems.reduce((sum, item) => sum + (item.price * item.quantity), 0);
-        let totalPrice = subtotal + 10;
+        let discountedPrice = subtotal * discountRate; // 应用折扣
+        let totalPrice = discountedPrice + 10; // 加上固定运费 10 元
 
-        // 3. 往 sale (主订单表) 里插入一条数据，模拟直接支付成功
+        // 5. 写入订单主表 (sale)
         const [saleResult] = await connection.query(`
             INSERT INTO sale (consumer_id, total_price, paid_amount, payment_status, delivery_status)
             VALUES (?, ?, ?, '已支付', '未发货') 
         `, [consumer_id, totalPrice, totalPrice]);
 
-        const saleId = saleResult.insertId; // 拿到刚刚生成的订单号！
+        const saleId = saleResult.insertId;
 
-        // 4. 循环把商品塞进 detail (订单明细表)，并且扣减库存！
+        // 6. 写入订单明细 (detail) 并扣库存
         for (const item of cartItems) {
-            // 写入明细
             await connection.query(`
                 INSERT INTO detail (sale_id, book_id, quantity, unit_price)
                 VALUES (?, ?, ?, ?)
-            `, [saleId, item.book_id, item.quantity, item.price]);
+            `, [saleId, item.book_id, item.quantity, item.price * discountRate]); // 记录打折后的单价
 
-            // 扣减书本库存
-            await connection.query(`
-                UPDATE book SET stock = stock - ? WHERE book_id = ?
-            `, [item.quantity, item.book_id]);
+            await connection.query(
+                'UPDATE book SET stock = stock - ? WHERE book_id = ?',
+                [item.quantity, item.book_id]
+            );
         }
 
-        // 5. 过河拆桥：清空这个人的购物车
-        await connection.query(`DELETE FROM shopping_cart WHERE consumer_id = ?`, [consumer_id]);
+        // 7. 清空购物车
+        await connection.query('DELETE FROM shopping_cart WHERE consumer_id = ?', [consumer_id]);
 
-        await connection.commit(); // 🌟 所有操作完美执行，提交事务！
-        res.json({ success: true, message: 'Order placed successfully!' });
+        await connection.commit();
+        res.json({ success: true, message: `结算成功！会员等级：${level}，已享${discountRate * 10}折` });
 
     } catch (error) {
-        await connection.rollback(); // 🚨 一旦中间任何一步报错，全部撤销回滚！
-        console.error('Checkout error:', error);
+        await connection.rollback();
         res.status(500).json({ success: false, message: error.message });
     } finally {
-        connection.release(); // 释放连接，养成好习惯
+        connection.release();
     }
 });
-
 
 // ====== 在 server.js 里面追加这段 ======
 
@@ -693,5 +704,51 @@ app.get('/api/admin/dashboard/stats', async (req, res) => {
         // 加了一个超级醒目的报错日志，万一还不行，看终端红字！
         console.error('🔥 大盘数据查询崩溃啦:', error);
         res.status(500).json({ success: false, message: '服务器数据统计异常' });
+    }
+});
+
+// 19. 获取库存预警列表 (对应文档 3.1.2 需求)[cite: 1]
+app.get('/api/admin/inventory/warning', async (req, res) => {
+    try {
+        // 查找库存低于 10 本的图书[cite: 1]
+        const [rows] = await pool.query('SELECT book_id, book_name, stock FROM book WHERE stock < 10 ORDER BY stock ASC');
+        res.json({ success: true, data: rows });
+    } catch (error) {
+        res.status(500).json({ success: false, message: '获取预警失败' });
+    }
+});
+
+// GET: 获取图书品类销售分析
+app.get('/api/admin/analysis/category', async (req, res) => {
+    try {
+        const sql = `
+            SELECT b.category, SUM(d.quantity) as total_qty, SUM(d.quantity * d.unit_price) as total_amount
+            FROM detail d
+            JOIN book b ON d.book_id = b.book_id
+            GROUP BY b.category
+            ORDER BY total_amount DESC
+        `;
+        const [rows] = await pool.query(sql);
+        res.json({ success: true, data: rows });
+    } catch (error) {
+        res.status(500).json({ success: false, message: '数据获取失败' });
+    }
+});
+
+
+// GET: 获取会员等级消费效能
+app.get('/api/admin/analysis/vip', async (req, res) => {
+    try {
+        const sql = `
+            SELECT c.vip_level, COUNT(DISTINCT c.consumer_id) as user_count, SUM(s.total_price) as total_revenue
+            FROM consumer c
+            LEFT JOIN sale s ON c.consumer_id = s.consumer_id
+            GROUP BY c.vip_level
+            ORDER BY total_revenue DESC
+        `;
+        const [rows] = await pool.query(sql);
+        res.json({ success: true, data: rows });
+    } catch (error) {
+        res.status(500).json({ success: false, message: '数据获取失败' });
     }
 });
