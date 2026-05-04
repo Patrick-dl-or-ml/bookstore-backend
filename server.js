@@ -61,12 +61,6 @@ app.get('/api/cart/:consumerId', async (req, res) => {
     }
 });
 
-// 启动服务器 (端口也支持云端动态分配)
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-    console.log(`🚀 Backend server is running on port ${PORT}`);
-});
-
 // ====== 在 server.js 原有的 app.get('/api/cart/:consumerId', ...) 下面添加这段 ======
 
 // 3. 获取后台订单大盘接口 (管理员视角)
@@ -780,4 +774,9 @@ app.get('/api/orders/user/:userId', async (req, res) => {
         console.error('获取订单失败:', error);
         res.status(500).json({ success: false, message: 'Server error' });
     }
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+    console.log(`🚀 Backend server is running on port ${PORT}`);
 });
