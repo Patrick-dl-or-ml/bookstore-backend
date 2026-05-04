@@ -752,3 +752,32 @@ app.get('/api/admin/analysis/vip', async (req, res) => {
         res.status(500).json({ success: false, message: '数据获取失败' });
     }
 });
+
+// --- 专门修复：匹配前端 MyOrders.vue 的路径 ---
+app.get('/api/orders/user/:userId', async (req, res) => {
+    try {
+        const userId = req.params.userId;
+        // 1. 查出订单主表
+        const [orders] = await pool.query(`
+            SELECT sale_id, total_price, payment_status, delivery_status, order_time as created_at 
+            FROM sale 
+            WHERE consumer_id = ? 
+            ORDER BY sale_id DESC
+        `, [userId]);
+
+        // 2. 核心：查出每个订单里的书（items），不然前端显示不出来买的东西
+        for (let order of orders) {
+            const [details] = await pool.query(`
+                SELECT d.quantity, d.unit_price, b.book_name, b.book_id
+                FROM detail d
+                JOIN book b ON d.book_id = b.book_id
+                WHERE d.sale_id = ?
+            `, [order.sale_id]);
+            order.items = details;
+        }
+        res.json({ success: true, data: orders });
+    } catch (error) {
+        console.error('获取订单失败:', error);
+        res.status(500).json({ success: false, message: 'Server error' });
+    }
+});
