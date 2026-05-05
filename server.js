@@ -526,22 +526,32 @@ app.delete('/api/admin/consumers/:id', async (req, res) => {
 // 📦 订单履约中心 (Order Command Center) 接口
 // ==========================================
 
-// 1. 增强版：多条件组合筛选订单 (对标 3.2.2.2)
+// --- 修复高额订单监控接口 ---
 app.get('/api/admin/orders', async (req, res) => {
-    const { status, payment, keyword } = req.query;
     try {
-        let sql = `SELECT s.*, c.consumer_name FROM sale s LEFT JOIN consumer c ON s.consumer_id = c.consumer_id WHERE 1=1`;
-        const params = [];
+        const sql = `
+            SELECT
+                s.saleid as sale_id,      -- 🌟 对应你表里的 saleid
+                s.totalprice as total_price, -- 🌟 对应你表里的 totalprice
+                c.consumername as consumer_name -- 🌟 对应你表里的 consumername
+            FROM sale s
+                     JOIN consumer c ON s.consumerid = c.consumerid
+            ORDER BY s.saleid DESC
+        `;
+        const [rows] = await pool.query(sql);
 
-        if (status) { sql += ` AND s.delivery_status = ?`; params.push(status); }
-        if (payment) { sql += ` AND s.payment_status = ?`; params.push(payment); }
-        if (keyword) { sql += ` AND (c.consumer_name LIKE ? OR s.sale_id LIKE ?)`; params.push(`%${keyword}%`, `%${keyword}%`); }
-
-        sql += ` ORDER BY s.order_time DESC`;
-        const [rows] = await pool.query(sql, params);
-        res.json({ success: true, data: rows });
+        // 即使没有数据，也要返回一个空数组，防止前端报错
+        res.json({
+            success: true,
+            data: rows || []
+        });
     } catch (error) {
-        res.status(500).json({ success: false, message: '获取订单失败' });
+        console.error('orders 接口崩溃:', error);
+        res.status(500).json({
+            success: false,
+            message: '无法获取订单列表',
+            details: error.message
+        });
     }
 });
 
@@ -718,19 +728,17 @@ app.put('/api/users/:id/addresses/:addressId/default', async (req, res) => {
 
 app.get('/api/admin/dashboard/stats', async (req, res) => {
     try {
-        // 1. 今日数据 (拆分开查，绝对防止连表导致金额翻倍)
-        const [todayRev] = await pool.query(`SELECT SUM(total_price) AS rev FROM sale WHERE DATE(order_time) = CURDATE() AND payment_status != '未支付'`);
-        const [todayQty] = await pool.query(`SELECT SUM(d.quantity) AS qty FROM sale s JOIN detail d ON s.sale_id = d.sale_id WHERE DATE(s.order_time) = CURDATE() AND s.payment_status != '未支付'`);
+        // 今日营收：使用 totalprice 和 ifpay
+        const [todayRev] = await pool.query(`SELECT SUM(totalprice) AS rev FROM sale WHERE DATE(order_time) = CURDATE() AND ifpay = '已支付'`);
+        // 今日销量：注意这里把 quantity 改成了你表里的 quality
+        const [todayQty] = await pool.query(`SELECT SUM(d.quality) AS qty FROM sale s JOIN detail d ON s.saleid = d.saleid WHERE DATE(s.order_time) = CURDATE() AND s.ifpay = '已支付'`);
 
-        // 2. 本月数据
-        const [monthRev] = await pool.query(`SELECT SUM(total_price) AS rev FROM sale WHERE YEAR(order_time) = YEAR(CURDATE()) AND MONTH(order_time) = MONTH(CURDATE()) AND payment_status != '未支付'`);
-        const [monthQty] = await pool.query(`SELECT SUM(d.quantity) AS qty FROM sale s JOIN detail d ON s.sale_id = d.sale_id WHERE YEAR(s.order_time) = YEAR(CURDATE()) AND MONTH(s.order_time) = MONTH(CURDATE()) AND s.payment_status != '未支付'`);
+        const [monthRev] = await pool.query(`SELECT SUM(totalprice) AS rev FROM sale WHERE YEAR(order_time) = YEAR(CURDATE()) AND MONTH(order_time) = MONTH(CURDATE()) AND ifpay = '已支付'`);
+        const [monthQty] = await pool.query(`SELECT SUM(d.quality) AS qty FROM sale s JOIN detail d ON s.saleid = d.saleid WHERE YEAR(s.order_time) = YEAR(CURDATE()) AND MONTH(s.order_time) = MONTH(CURDATE()) AND s.ifpay = '已支付'`);
 
-        // 3. 基础容量
         const [users] = await pool.query('SELECT COUNT(*) AS total FROM consumer');
         const [books] = await pool.query('SELECT COUNT(*) AS total FROM book');
 
-        // 安全回落机制：如果查出来是 null，统一给 0
         res.json({
             success: true,
             data: {
@@ -743,9 +751,8 @@ app.get('/api/admin/dashboard/stats', async (req, res) => {
             }
         });
     } catch (error) {
-        // 加了一个超级醒目的报错日志，万一还不行，看终端红字！
-        console.error('🔥 大盘数据查询崩溃啦:', error);
-        res.status(500).json({ success: false, message: '服务器数据统计异常' });
+        console.error('🔥 大盘数据统计异常:', error);
+        res.status(500).json({ success: false, message: error.message });
     }
 });
 
@@ -760,43 +767,44 @@ app.get('/api/admin/inventory/warning', async (req, res) => {
     }
 });
 
-// GET: 获取图书品类销售分析
 app.get('/api/admin/analysis/category', async (req, res) => {
     try {
         const sql = `
-            SELECT b.category, SUM(d.quantity) as total_qty, SUM(d.quantity * d.unit_price) as total_amount
+            SELECT
+                b.categoryname as category,
+                SUM(d.quality) as total_qty, -- 🌟 你的表里叫 quality
+                SUM(d.quality * b.price) as total_amount -- 🌟 销量乘以单价
             FROM detail d
-            JOIN book b ON d.book_id = b.book_id
-            GROUP BY b.category
+                     JOIN book b ON d.bookid = b.bookid -- 🌟 你的表里叫 bookid
+            GROUP BY b.categoryname
             ORDER BY total_amount DESC
         `;
         const [rows] = await pool.query(sql);
         res.json({ success: true, data: rows });
     } catch (error) {
-        res.status(500).json({ success: false, message: '数据获取失败' });
+        console.error('品类分析报错:', error);
+        res.status(500).json({ success: false, message: error.message });
     }
 });
 
-
-// GET: 获取会员等级消费与余额效能分析 (对标 3.2.1 & 3.2.4)[cite: 1]
 app.get('/api/admin/analysis/vip', async (req, res) => {
     try {
         const sql = `
             SELECT
-                c.vip_level,
-                COUNT(DISTINCT c.consumer_id) as user_count,
-                SUM(s.total_price) as total_revenue,
-                AVG(c.balance) as avg_balance  -- 🌟 统计该等级下的平均账户余额[cite: 1]
+                c.vip as vip_level,
+                COUNT(DISTINCT c.consumerid) as user_count,
+                SUM(s.totalprice) as total_revenue,
+                AVG(c.balance) as avg_balance
             FROM consumer c
-                     LEFT JOIN sale s ON c.consumer_id = s.consumer_id
-            GROUP BY c.vip_level
+                     LEFT JOIN sale s ON c.consumerid = s.consumerid
+            GROUP BY c.vip
             ORDER BY user_count DESC
         `;
         const [rows] = await pool.query(sql);
         res.json({ success: true, data: rows });
     } catch (error) {
-        console.error('会员分析查询崩溃:', error);
-        res.status(500).json({ success: false, message: '分析数据获取失败' });
+        console.error('会员分析报错:', error);
+        res.status(500).json({ success: false, message: error.message });
     }
 });
 
@@ -838,45 +846,59 @@ app.listen(PORT, () => {
 app.get('/api/admin/analysis/top-customers', async (req, res) => {
     try {
         const sql = `
-            SELECT c.consumer_name, COUNT(s.sale_id) as order_count, SUM(s.total_price) as total_spent 
-            FROM consumer c 
-            JOIN sale s ON c.consumer_id = s.consumer_id 
-            GROUP BY c.consumer_id 
-            ORDER BY total_spent DESC 
-            LIMIT 5
+            SELECT c.consumername as consumer_name, SUM(s.totalprice) as total_spent
+            FROM sale s
+                     JOIN consumer c ON s.consumerid = c.consumerid
+            GROUP BY c.consumerid
+            ORDER BY total_spent DESC
+                LIMIT 5
         `;
         const [rows] = await pool.query(sql);
         res.json({ success: true, data: rows });
     } catch (error) {
-        res.status(500).json({ success: false, message: '获取客户排行失败' });
+        console.error('top-customers 报错:', error);
+        res.status(500).json({ success: false, message: error.message });
     }
 });
 
-// 2. 按图书统计：获取畅销图书排行榜 (对标 3.2.3.3)
 app.get('/api/admin/analysis/top-books', async (req, res) => {
     try {
         const sql = `
-            SELECT b.book_name, SUM(d.quantity) as total_sold, SUM(d.quantity * d.unit_price) as revenue
-            FROM detail d 
-            JOIN book b ON d.book_id = b.book_id 
-            GROUP BY b.book_id 
-            ORDER BY total_sold DESC 
-            LIMIT 5
+            SELECT b.bookname as book_name, SUM(d.quality) as total_sold
+            FROM detail d
+                     JOIN book b ON d.bookid = b.bookid
+            GROUP BY b.bookid
+            ORDER BY total_sold DESC
+                LIMIT 5
         `;
         const [rows] = await pool.query(sql);
         res.json({ success: true, data: rows });
     } catch (error) {
-        res.status(500).json({ success: false, message: '获取图书排行失败' });
+        console.error('top-books 报错:', error);
+        res.status(500).json({ success: false, message: error.message });
     }
 });
 
-// 3. 按物流状态统计：实时履约分布 (对标 3.2.3.5)
 app.get('/api/admin/analysis/logistics', async (req, res) => {
     try {
-        const sql = `SELECT delivery_status, COUNT(*) as count FROM sale GROUP BY delivery_status`;
+        const sql = `
+            SELECT
+                statu AS delivery_status, -- 🌟 把数据库里的 statu 映射为前端需要的 delivery_status
+                COUNT(*) AS count
+            FROM sale
+            GROUP BY statu
+        `;
         const [rows] = await pool.query(sql);
-        res.json({ success: true, data: rows });
+        res.json({
+            success: true,
+            data: rows
+        });
     } catch (error) {
-        res.status(500).json({ success: false, message: '获取物流统计失败' });
+        console.error('物流分析接口报错:', error);
+        res.status(500).json({
+            success: false,
+            message: '无法获取物流数据',
+            details: error.message
+        });
     }
 });
