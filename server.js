@@ -61,33 +61,6 @@ app.get('/api/cart/:consumerId', async (req, res) => {
     }
 });
 
-// ====== 在 server.js 原有的 app.get('/api/cart/:consumerId', ...) 下面添加这段 ======
-
-// 3. 获取后台订单大盘接口 (管理员视角)
-app.get('/api/admin/orders', async (req, res) => {
-    try {
-        const [rows] = await pool.query(`
-            SELECT 
-                s.sale_id, 
-                s.total_price, 
-                s.payment_status, 
-                s.delivery_status, 
-                s.order_time,
-                c.consumer_name, 
-                c.phone
-            FROM sale s
-            LEFT JOIN consumer c ON s.consumer_id = c.consumer_id
-            ORDER BY s.order_time DESC
-            LIMIT 50 -- 先展示最新50条防止卡顿
-        `);
-
-        res.json({ success: true, data: rows });
-    } catch (error) {
-        console.error('Database error:', error);
-        res.status(500).json({ success: false, message: 'Server error' });
-    }
-});
-
 // ====== 在 server.js 里面追加这段 ======
 // 4. 获取图书列表 (支持搜索、分类、且带分页功能！)
 app.get('/api/books', async (req, res) => {
@@ -412,27 +385,24 @@ app.put('/api/admin/books/:id', async (req, res) => {
 
 // ====== 在 server.js 里面追加这段 ======
 
-// 15. 新用户注册接口 (POST)
+// 15. 新用户注册接口 (POST) - 完备版 (对标需求文档 3.2.1)
 app.post('/api/register', async (req, res) => {
     const { username, password, email, phone } = req.body;
-
     try {
-        // 先检查用户名是否已经被占用了
         const [exist] = await pool.query('SELECT * FROM consumer WHERE consumer_name = ?', [username]);
         if (exist.length > 0) {
             return res.status(400).json({ success: false, message: '该用户名已被注册，请换一个' });
         }
 
-        // 插入新用户数据，初始积分为0，VIP等级为0
+        // 🌟 核心改进：记录注册时间 NOW() 和初始余额 0
         const [result] = await pool.query(
-            'INSERT INTO consumer (consumer_name, consumer_pass, email, phone, vip_level, integral) VALUES (?, ?, ?, ?, 0, 0)',
+            'INSERT INTO consumer (consumer_name, consumer_pass, email, phone, vip_level, integral, balance, register_time) VALUES (?, ?, ?, ?, 0, 0, 0, NOW())',
             [username, password, email, phone]
         );
 
         res.json({
             success: true,
             message: '注册成功！',
-            // 顺便把新生成的 ID 传回去，方便前端直接登录
             user: { id: result.insertId, name: username, role: 'user' }
         });
     } catch (error) {
@@ -512,18 +482,43 @@ app.get('/api/admin/consumers/:id/addresses', async (req, res) => {
     }
 });
 
-// 3. 修改客户信息 (比如管理员手动发积分、升降 VIP)
+// 3. 修改客户信息 (对标 3.2.1：支持修改电话、等级、余额等)
 app.put('/api/admin/consumers/:id', async (req, res) => {
-    const { consumer_name, email, vip_level, integral } = req.body;
+    // 🌟 增加接收 balance 字段
+    const { consumer_name, email, phone, vip_level, integral, balance } = req.body;
+
     try {
-        await pool.query(
-            'UPDATE consumer SET consumer_name = ?, email = ?, vip_level = ?, integral = ? WHERE consumer_id = ?',
-            [consumer_name, email, vip_level, integral, req.params.id]
-        );
-        res.json({ success: true, message: '客户信息修改成功' });
+        const sql = `
+            UPDATE consumer 
+            SET consumer_name = ?, email = ?, phone = ?, vip_level = ?, integral = ?, balance = ? 
+            WHERE consumer_id = ?
+        `;
+        await pool.query(sql, [consumer_name, email, phone, vip_level, integral, balance, req.params.id]);
+        res.json({ success: true, message: '客户资料已更新' });
     } catch (error) {
-        console.error('修改客户信息失败:', error);
-        res.status(500).json({ success: false, message: '服务器异常' });
+        console.error('修改客户资料失败:', error);
+        res.status(500).json({ success: false, message: '服务器异常，修改失败' });
+    }
+});
+
+// 3.5 删除客户 (增加“无订单记录”安全检查[cite: 1])
+app.delete('/api/admin/consumers/:id', async (req, res) => {
+    const userId = req.params.id;
+    try {
+        // 第一步：安全检查，有订单记录的客户不许删[cite: 1]
+        const [orders] = await pool.query('SELECT sale_id FROM sale WHERE consumer_id = ?', [userId]);
+        if (orders.length > 0) {
+            return res.status(400).json({
+                success: false,
+                message: '该客户存在历史订单记录，为保护财务数据无法物理注销'
+            });
+        }
+        // 第二步：没订单才允许删
+        await pool.query('DELETE FROM consumer WHERE consumer_id = ?', [userId]);
+        res.json({ success: true, message: '客户账号已成功注销' });
+    } catch (error) {
+        console.error('注销客户失败:', error);
+        res.status(500).json({ success: false, message: '服务器忙，请稍后再试' });
     }
 });
 
@@ -531,49 +526,102 @@ app.put('/api/admin/consumers/:id', async (req, res) => {
 // 📦 订单履约中心 (Order Command Center) 接口
 // ==========================================
 
-// 1. 获取所有订单 (带分页在前端做，后端一次性返回)
+// 1. 增强版：多条件组合筛选订单 (对标 3.2.2.2)
 app.get('/api/admin/orders', async (req, res) => {
+    const { status, payment, keyword } = req.query;
     try {
-        const [rows] = await pool.query('SELECT * FROM sale ORDER BY order_time DESC');
+        let sql = `SELECT s.*, c.consumer_name FROM sale s LEFT JOIN consumer c ON s.consumer_id = c.consumer_id WHERE 1=1`;
+        const params = [];
+
+        if (status) { sql += ` AND s.delivery_status = ?`; params.push(status); }
+        if (payment) { sql += ` AND s.payment_status = ?`; params.push(payment); }
+        if (keyword) { sql += ` AND (c.consumer_name LIKE ? OR s.sale_id LIKE ?)`; params.push(`%${keyword}%`, `%${keyword}%`); }
+
+        sql += ` ORDER BY s.order_time DESC`;
+        const [rows] = await pool.query(sql, params);
         res.json({ success: true, data: rows });
     } catch (error) {
-        console.error('获取订单列表失败:', error);
-        res.status(500).json({ success: false, message: '服务器异常' });
+        res.status(500).json({ success: false, message: '获取订单失败' });
     }
 });
 
-// 2. 获取订单明细 (联表查询，把 book 表里的名字查出来)
+// 2. 获取订单明细 (保留原有逻辑)
 app.get('/api/admin/orders/:id/details', async (req, res) => {
     try {
         const [rows] = await pool.query(`
-            SELECT d.*, b.book_name, b.author 
-            FROM detail d 
-            JOIN book b ON d.book_id = b.book_id 
+            SELECT d.*, b.book_name, b.author
+            FROM detail d
+                     JOIN book b ON d.book_id = b.book_id
             WHERE d.sale_id = ?
         `, [req.params.id]);
         res.json({ success: true, data: rows });
     } catch (error) {
-        console.error('获取订单明细失败:', error);
         res.status(500).json({ success: false, message: '服务器异常' });
     }
 });
 
-// 3. 管理员发货 (修改物流状态)
-app.put('/api/admin/orders/:id/dispatch', async (req, res) => {
-    const { delivery_status } = req.body;
+// 3. 级联删除订单：删除订单及其关联的所有明细 (对标 3.2.2.1)
+app.delete('/api/admin/orders/:id', async (req, res) => {
+    const saleId = req.params.id;
+    const connection = await pool.getConnection();
     try {
-        // 更新发货状态，并记录发货时间
-        await pool.query(
-            'UPDATE sale SET delivery_status = ?, delivery_time = NOW() WHERE sale_id = ?',
-            [delivery_status, req.params.id]
-        );
-        res.json({ success: true, message: '发货成功' });
+        await connection.beginTransaction();
+        await connection.query('DELETE FROM detail WHERE sale_id = ?', [saleId]);
+        await connection.query('DELETE FROM sale WHERE sale_id = ?', [saleId]);
+        await connection.commit();
+        res.json({ success: true, message: '订单及其明细已彻底级联删除' });
     } catch (error) {
-        console.error('发货失败:', error);
-        res.status(500).json({ success: false, message: '服务器异常' });
+        await connection.rollback();
+        res.status(500).json({ success: false, message: '删除失败' });
+    } finally {
+        connection.release();
     }
 });
 
+// 4. 修改订单基础信息 (日期、地址、支付状态)
+app.put('/api/admin/orders/:id', async (req, res) => {
+    const { order_time, payment_method, delivery_address, delivery_status, payment_status } = req.body;
+    try {
+        const sql = `
+            UPDATE sale 
+            SET order_time = ?, payment_method = ?, delivery_address = ?, 
+                delivery_status = ?, payment_status = ? 
+            WHERE sale_id = ?
+        `;
+        await pool.query(sql, [order_time, payment_method, delivery_address, delivery_status, payment_status, req.params.id]);
+        res.json({ success: true, message: '订单基础信息已更新' });
+    } catch (error) {
+        res.status(500).json({ success: false, message: '基础信息修改失败' });
+    }
+});
+
+// 5. 核心逻辑：修改明细数量并自动重算订单总额 (对标 3.2.2.1)
+app.put('/api/admin/orders/:saleId/details/:detailId', async (req, res) => {
+    const { saleId, detailId } = req.params;
+    const { quantity } = req.body;
+    const connection = await pool.getConnection();
+
+    try {
+        await connection.beginTransaction();
+        const [detail] = await connection.query('SELECT unit_price FROM detail WHERE detail_id = ?', [detailId]);
+        if (detail.length === 0) throw new Error('明细不存在');
+
+        await connection.query('UPDATE detail SET quantity = ? WHERE detail_id = ?', [quantity, detailId]);
+
+        // 重新汇总金额 + 10元固定运费[cite: 1]
+        const [allDetails] = await connection.query('SELECT SUM(quantity * unit_price) as subtotal FROM detail WHERE sale_id = ?', [saleId]);
+        const newTotal = (allDetails[0].subtotal || 0) + 10;
+
+        await connection.query('UPDATE sale SET total_price = ? WHERE sale_id = ?', [newTotal, saleId]);
+        await connection.commit();
+        res.json({ success: true, message: '明细已调整，订单总额已自动同步重算', newTotal });
+    } catch (error) {
+        await connection.rollback();
+        res.status(500).json({ success: false, message: error.message });
+    } finally {
+        connection.release();
+    }
+});
 // ==========================================
 // 👤 C端用户：个人中心接口 (User Profile)
 // ==========================================
@@ -730,20 +778,25 @@ app.get('/api/admin/analysis/category', async (req, res) => {
 });
 
 
-// GET: 获取会员等级消费效能
+// GET: 获取会员等级消费与余额效能分析 (对标 3.2.1 & 3.2.4)[cite: 1]
 app.get('/api/admin/analysis/vip', async (req, res) => {
     try {
         const sql = `
-            SELECT c.vip_level, COUNT(DISTINCT c.consumer_id) as user_count, SUM(s.total_price) as total_revenue
+            SELECT
+                c.vip_level,
+                COUNT(DISTINCT c.consumer_id) as user_count,
+                SUM(s.total_price) as total_revenue,
+                AVG(c.balance) as avg_balance  -- 🌟 统计该等级下的平均账户余额[cite: 1]
             FROM consumer c
-            LEFT JOIN sale s ON c.consumer_id = s.consumer_id
+                     LEFT JOIN sale s ON c.consumer_id = s.consumer_id
             GROUP BY c.vip_level
-            ORDER BY total_revenue DESC
+            ORDER BY user_count DESC
         `;
         const [rows] = await pool.query(sql);
         res.json({ success: true, data: rows });
     } catch (error) {
-        res.status(500).json({ success: false, message: '数据获取失败' });
+        console.error('会员分析查询崩溃:', error);
+        res.status(500).json({ success: false, message: '分析数据获取失败' });
     }
 });
 
@@ -779,4 +832,51 @@ app.get('/api/orders/user/:userId', async (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`🚀 Backend server is running on port ${PORT}`);
+});
+
+// 1. 按客户统计：获取核心客户贡献榜 (对标 3.2.3.2)
+app.get('/api/admin/analysis/top-customers', async (req, res) => {
+    try {
+        const sql = `
+            SELECT c.consumer_name, COUNT(s.sale_id) as order_count, SUM(s.total_price) as total_spent 
+            FROM consumer c 
+            JOIN sale s ON c.consumer_id = s.consumer_id 
+            GROUP BY c.consumer_id 
+            ORDER BY total_spent DESC 
+            LIMIT 5
+        `;
+        const [rows] = await pool.query(sql);
+        res.json({ success: true, data: rows });
+    } catch (error) {
+        res.status(500).json({ success: false, message: '获取客户排行失败' });
+    }
+});
+
+// 2. 按图书统计：获取畅销图书排行榜 (对标 3.2.3.3)
+app.get('/api/admin/analysis/top-books', async (req, res) => {
+    try {
+        const sql = `
+            SELECT b.book_name, SUM(d.quantity) as total_sold, SUM(d.quantity * d.unit_price) as revenue
+            FROM detail d 
+            JOIN book b ON d.book_id = b.book_id 
+            GROUP BY b.book_id 
+            ORDER BY total_sold DESC 
+            LIMIT 5
+        `;
+        const [rows] = await pool.query(sql);
+        res.json({ success: true, data: rows });
+    } catch (error) {
+        res.status(500).json({ success: false, message: '获取图书排行失败' });
+    }
+});
+
+// 3. 按物流状态统计：实时履约分布 (对标 3.2.3.5)
+app.get('/api/admin/analysis/logistics', async (req, res) => {
+    try {
+        const sql = `SELECT delivery_status, COUNT(*) as count FROM sale GROUP BY delivery_status`;
+        const [rows] = await pool.query(sql);
+        res.json({ success: true, data: rows });
+    } catch (error) {
+        res.status(500).json({ success: false, message: '获取物流统计失败' });
+    }
 });
