@@ -120,32 +120,32 @@ app.get('/api/books', async (req, res) => {
 
 // 5. 加入购物车接口 (POST 请求)
 app.post('/api/cart', async (req, res) => {
-    // 从前端发来的请求里拿到用户ID和图书ID
+    // 前端传过来的是带有下划线的变量
     const { consumer_id, book_id } = req.body;
 
     try {
-        // 先偷偷查一下：这个人的购物车里，是不是已经有这本书了？
+        // 🚨 修正1：表名改为 shopcar，字段名改为 consumerid, bookid, carid
         const [exist] = await pool.query(
-            'SELECT cart_id, quantity FROM shopping_cart WHERE consumer_id = ? AND book_id = ?',
+            'SELECT carid FROM shopcar WHERE consumerid = ? AND bookid = ?',
             [consumer_id, book_id]
         );
 
         if (exist.length > 0) {
-            // 如果已经有了，数量直接 +1
+            // 如果已经有了，数量直接 +1 (⚠️ 前提是你在 Navicat 的 shopcar 表里加上了 quantity 字段)
             await pool.query(
-                'UPDATE shopping_cart SET quantity = quantity + 1 WHERE cart_id = ?',
-                [exist[0].cart_id]
+                'UPDATE shopcar SET quantity = quantity + 1 WHERE carid = ?',
+                [exist[0].carid]
             );
         } else {
-            // 如果没有，就往购物车表里插入一条新数据
+            // 🚨 修正2：往 shopcar 表里插入数据，严格匹配数据库列名
             await pool.query(
-                'INSERT INTO shopping_cart (consumer_id, book_id, quantity) VALUES (?, ?, 1)',
+                'INSERT INTO shopcar (consumerid, bookid, quantity) VALUES (?, ?, 1)',
                 [consumer_id, book_id]
             );
         }
         res.json({ success: true, message: 'Successfully added to cart!' });
     } catch (error) {
-        console.error('Add to cart error:', error);
+        console.error('加购崩溃了:', error.message);
         res.status(500).json({ success: false, message: 'Server error' });
     }
 });
