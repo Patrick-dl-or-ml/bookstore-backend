@@ -447,11 +447,14 @@ app.put('/api/admin/orders/:id/deliver', async (req, res) => {
 // 18. 获取所有分类字典
 app.get('/api/categories', async (req, res) => {
     try {
-        // 🌟 重点看这里：一定要把 category_id 也 SELECT 出来！
-        const [rows] = await pool.query('SELECT category_id, category_name FROM category');
+        // 🌟 核心修复：根据你的 Navicat 截图，表名是 categories（带s）
+        // 并且字段名必须严格匹配 category_id 和 category_name
+        const [rows] = await pool.query('SELECT category_id, category_name FROM categories');
+
         res.json({ success: true, data: rows });
     } catch (error) {
-        console.error('获取分类失败:', error);
+        // 如果这里还报错，Render 的后台日志会打印出下面这行红字，告诉你具体错在哪
+        console.error('获取分类失败:', error.message);
         res.status(500).json({ success: false, message: '服务器异常' });
     }
 });
