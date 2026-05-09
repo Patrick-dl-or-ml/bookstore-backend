@@ -848,25 +848,29 @@ app.listen(PORT, () => {
     console.log(`🚀 Backend server is running on port ${PORT}`);
 });
 
-// 1. 按客户统计：获取核心客户贡献榜 (对标 3.2.3.2)
-app.get('/api/admin/analysis/top-customers', async (req, res) => {
+// 1. 获取所有客户列表
+app.get('/api/admin/consumers', async (req, res) => {
     try {
+        // 🚨 核心修正：严格映射 consumerid, consumername, vip 等字段给前端
         const sql = `
-            SELECT c.consumername as consumer_name, SUM(s.totalprice) as total_spent
-            FROM sale s
-                     JOIN consumer c ON s.consumerid = c.consumerid
-            GROUP BY c.consumerid
-            ORDER BY total_spent DESC
-                LIMIT 5
+            SELECT
+                consumerid AS consumer_id,
+                consumername AS consumer_name,
+                email,
+                vip AS vip_level,
+                integral,
+                balance,
+                register_time
+            FROM consumer
+            ORDER BY register_time DESC
         `;
         const [rows] = await pool.query(sql);
         res.json({ success: true, data: rows });
     } catch (error) {
-        console.error('top-customers 报错:', error);
-        res.status(500).json({ success: false, message: error.message });
+        console.error('获取客户列表失败:', error.message);
+        res.status(500).json({ success: false, message: '服务器异常' });
     }
 });
-
 app.get('/api/admin/analysis/top-books', async (req, res) => {
     try {
         const sql = `
