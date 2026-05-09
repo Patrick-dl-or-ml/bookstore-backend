@@ -273,16 +273,6 @@ app.post('/api/admin/books', async (req, res) => {
     }
 });
 
-// 10. 管理员：下架/删除图书 (DELETE)
-app.delete('/api/admin/books/:id', async (req, res) => {
-    try {
-        await pool.query('DELETE FROM book WHERE book_id = ?', [req.params.id]);
-        res.json({ success: true, message: 'Book deleted!' });
-    } catch (error) {
-        res.status(500).json({ success: false, message: 'Failed to delete book' });
-    }
-});
-
 // 11. 登录接口 (POST)
 app.post('/api/login', async (req, res) => {
     const { username, password, role } = req.body;
@@ -406,18 +396,29 @@ app.post('/api/register', async (req, res) => {
 
 // ====== 在 server.js 里面追加这两段 ======
 
-// 16. 修改购物车数量 (PUT)
-app.put('/api/cart/:cartId', async (req, res) => {
-    const { quantity } = req.body;
+// Admin: 删除/下架图书 (DELETE) - 双保险终极版
+app.delete('/api/admin/books/:id', async (req, res) => {
+    const bookId = req.params.id;
     try {
-        if (quantity <= 0) {
-            await pool.query('DELETE FROM shopcar WHERE carid = ?', [req.params.cartId]);
-        } else {
-            await pool.query('UPDATE shopcar SET quantity = ? WHERE carid = ?', [quantity, req.params.cartId]);
-        }
-        res.json({ success: true, message: '数量已更新' });
+        // 第一步：先去购物车表 (shopcar) 里把关联这本书的记录清空，解除外键约束，字段是 bookid
+        await pool.query('DELETE FROM shopcar WHERE bookid = ?', [bookId]);
+
+        // 第二步：尝试直接从 book 表里彻底物理删除，字段是 bookid
+        await pool.query('DELETE FROM book WHERE bookid = ?', [bookId]);
+
+        res.json({ success: true, message: '书籍已从数据库彻底删除！' });
     } catch (error) {
-        res.status(500).json({ success: false, message: '更新失败' });
+        console.error('物理删除失败，触发降级下架方案:', error.message);
+
+        // 第三步（降级方案）：如果物理删除失败（说明这本书在 detail 订单明细表里存在，数据库拒绝删除以保全财务记录）
+        // 那我们就把库存清零，当做“软下架”处理，字段是 bookid
+        try {
+            await pool.query('UPDATE book SET stock = 0 WHERE bookid = ?', [bookId]);
+            res.json({ success: true, message: '该书存在历史订单无法销毁，已强制清空库存下架！' });
+        } catch (err2) {
+            console.error('软下架也崩了:', err2.message);
+            res.status(500).json({ success: false, message: '服务器异常' });
+        }
     }
 });
 
