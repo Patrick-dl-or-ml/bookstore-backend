@@ -848,10 +848,10 @@ app.listen(PORT, () => {
     console.log(`🚀 Backend server is running on port ${PORT}`);
 });
 
-// 1. 获取所有客户列表
+// 1. 获取所有客户列表 (Admin端专用)
 app.get('/api/admin/consumers', async (req, res) => {
     try {
-        // 🚨 核心修正：严格映射 consumerid, consumername, vip 等字段给前端
+        // 🌟 核心修正：使用 AS 将数据库字段映射为前端期望的名称
         const sql = `
             SELECT
                 consumerid AS consumer_id,
@@ -871,6 +871,7 @@ app.get('/api/admin/consumers', async (req, res) => {
         res.status(500).json({ success: false, message: '服务器异常' });
     }
 });
+
 app.get('/api/admin/analysis/top-books', async (req, res) => {
     try {
         const sql = `
