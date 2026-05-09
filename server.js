@@ -320,27 +320,27 @@ app.post('/api/admin/books', async (req, res) => {
     }
 });
 
-// 13. 管理员：删除图书 (DELETE) - 双保险终极版
+// 📚 Admin: 终极删除/下架图书 (唯一正确版，全场只能有这一个)
 app.delete('/api/admin/books/:id', async (req, res) => {
     const bookId = req.params.id;
     try {
-        // 第一步：先去购物车里把关联这本书的记录清空（解除外键约束 1）
-        await pool.query('DELETE FROM shopping_cart WHERE book_id = ?', [bookId]);
+        // 第一步：清空购物车里的外键关联
+        await pool.query('DELETE FROM shopcar WHERE bookid = ?', [bookId]);
 
-        // 第二步：尝试直接从数据库里彻底物理删除
-        await pool.query('DELETE FROM book WHERE book_id = ?', [bookId]);
+        // 第二步：尝试物理删除 (字段名必须是 bookid)
+        await pool.query('DELETE FROM book WHERE bookid = ?', [bookId]);
 
-        res.json({ success: true, message: '书籍已从数据库彻底删除！' });
+        res.json({ success: true, message: '书籍彻底物理删除成功！' });
     } catch (error) {
-        console.error('物理删除失败，尝试触发降级下架方案:', error);
+        console.log('有历史订单，物理删除被拦截，进入软下架流程:', error.message);
 
-        // 如果物理删除失败（说明这本书在真实的 sale 订单表里存在，数据库拒绝删除以保全财务记录）
-        // 第三步（降级方案）：把库存设为 -1，当做“软下架”处理
+        // 第三步：降级方案 -> 软下架 (库存清零)
         try {
-            await pool.query('UPDATE book SET stock = -1 WHERE book_id = ?', [bookId]);
-            res.json({ success: true, message: '该书存在历史订单无法物理销毁，已强制清空库存并下架隐藏！' });
+            await pool.query('UPDATE book SET stock = 0 WHERE bookid = ?', [bookId]);
+            res.json({ success: true, message: '已作为历史资产保留，并强制清空库存下架！' });
         } catch (err2) {
-            res.status(500).json({ success: false, message: '服务器彻底罢工了，请看终端红字报错' });
+            console.error('软下架也报错了:', err2.message);
+            res.status(500).json({ success: false, message: '服务器彻底罢工了' });
         }
     }
 });
@@ -394,33 +394,6 @@ app.post('/api/register', async (req, res) => {
     }
 });
 
-// ====== 在 server.js 里面追加这两段 ======
-
-// Admin: 删除/下架图书 (DELETE) - 双保险终极版
-app.delete('/api/admin/books/:id', async (req, res) => {
-    const bookId = req.params.id;
-    try {
-        // 第一步：先去购物车表 (shopcar) 里把关联这本书的记录清空，解除外键约束，字段是 bookid
-        await pool.query('DELETE FROM shopcar WHERE bookid = ?', [bookId]);
-
-        // 第二步：尝试直接从 book 表里彻底物理删除，字段是 bookid
-        await pool.query('DELETE FROM book WHERE bookid = ?', [bookId]);
-
-        res.json({ success: true, message: '书籍已从数据库彻底删除！' });
-    } catch (error) {
-        console.error('物理删除失败，触发降级下架方案:', error.message);
-
-        // 第三步（降级方案）：如果物理删除失败（说明这本书在 detail 订单明细表里存在，数据库拒绝删除以保全财务记录）
-        // 那我们就把库存清零，当做“软下架”处理，字段是 bookid
-        try {
-            await pool.query('UPDATE book SET stock = 0 WHERE bookid = ?', [bookId]);
-            res.json({ success: true, message: '该书存在历史订单无法销毁，已强制清空库存下架！' });
-        } catch (err2) {
-            console.error('软下架也崩了:', err2.message);
-            res.status(500).json({ success: false, message: '服务器异常' });
-        }
-    }
-});
 
 // 17. 管理员：订单发货 (PUT)
 app.put('/api/admin/orders/:id/deliver', async (req, res) => {
