@@ -61,46 +61,48 @@ app.get('/api/cart/:consumerId', async (req, res) => {
     }
 });
 
-// ====== 在 server.js 里面追加这段 ======
-// 4. 获取图书列表 (支持搜索、分类、且带分页功能！)
+// 4. 获取图书列表 (适配你的数据库字段：quality, categoryname)
 app.get('/api/books', async (req, res) => {
-    // 默认值：如果没有传，默认查第 1 页，每页展示 8 本书
     const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 8;
-    const offset = (page - 1) * limit; // 计算要跳过多少条数据
+    const limit = parseInt(req.query.limit) || 12; // 商店一页多显示点
+    const offset = (page - 1) * limit;
 
     const keyword = req.query.keyword;
     const category = req.query.category;
 
     try {
-        // 构建基础的 WHERE 条件
-        let baseSql = `
-            FROM book b 
-            LEFT JOIN category c ON b.category_id = c.category_id 
-            WHERE b.status = '上架'
-        `;
+        // 注意：这里去掉了 LEFT JOIN，直接查 book 表里的 categoryname
+        let baseSql = ` FROM book WHERE 1=1 `;
         let params = [];
 
         if (keyword) {
-            baseSql += ` AND (b.book_name LIKE ? OR b.author LIKE ?)`;
+            baseSql += ` AND (bookname LIKE ? OR author LIKE ?)`;
             params.push(`%${keyword}%`, `%${keyword}%`);
         }
 
         if (category && category !== 'All') {
-            baseSql += ` AND c.category_name = ?`;
+            baseSql += ` AND categoryname = ?`;
             params.push(category);
         }
 
-        // 🌟 核心 1：先查符合条件的总条数
         const [countResult] = await pool.query(`SELECT COUNT(*) as total ${baseSql}`, params);
         const total = countResult[0].total;
 
-        // 🌟 核心 2：再查当前页的具体数据 (拼上 LIMIT 和 OFFSET)
-        const dataSql = `SELECT b.*, c.category_name ${baseSql} ORDER BY b.book_id DESC LIMIT ? OFFSET ?`;
-        // 注意 params 的顺序，LIMIT 和 OFFSET 必须在最后
+        // 🌟 核心修复：用 AS 把数据库的列名映射成前端需要的变量名，并伪造一个 stock 库存
+        const dataSql = `
+    SELECT 
+        bookid AS book_id, 
+        bookname AS book_name, 
+        author, 
+        isbn, 
+        categoryname AS category_name, 
+        quality, 
+        price, 
+        50 AS stock 
+    ${baseSql} ORDER BY bookid DESC LIMIT ? OFFSET ?
+`;
         const [rows] = await pool.query(dataSql, [...params, limit, offset]);
 
-        // 把总数、当前页码一起打包丢给前端
         res.json({
             success: true,
             data: rows,
@@ -109,8 +111,8 @@ app.get('/api/books', async (req, res) => {
             totalPages: Math.ceil(total / limit)
         });
     } catch (error) {
-        console.error('搜索/分页失败:', error);
-        res.status(500).json({ success: false, message: '服务器异常' });
+        console.error('Store API Error:', error);
+        res.status(500).json({ success: false, message: '服务器查询失败' });
     }
 });
 
