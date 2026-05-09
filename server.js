@@ -801,31 +801,44 @@ app.get('/api/admin/analysis/vip', async (req, res) => {
     }
 });
 
-// --- 专门修复：匹配前端 MyOrders.vue 的路径 ---
+// 获取我的订单 (前端 C端 MyOrders.vue 和大盘共用)
 app.get('/api/orders/user/:userId', async (req, res) => {
     try {
         const userId = req.params.userId;
-        // 1. 查出订单主表
+
+        // 🚨 修正1：严格匹配 sale 表的真实字段（saleid, totalprice, ifpay, statu, consumerid, order_time）
+        // 然后用 AS 翻译成前端需要的变量名
         const [orders] = await pool.query(`
-            SELECT sale_id, total_price, payment_status, delivery_status, order_time as created_at 
-            FROM sale 
-            WHERE consumer_id = ? 
-            ORDER BY sale_id DESC
+            SELECT
+                saleid AS sale_id,
+                totalprice AS total_price,
+                ifpay AS payment_status,
+                statu AS delivery_status,
+                order_time AS created_at
+            FROM sale
+            WHERE consumerid = ?
+            ORDER BY saleid DESC
         `, [userId]);
 
-        // 2. 核心：查出每个订单里的书（items），不然前端显示不出来买的东西
+        // 🚨 修正2：循环查询订单明细，严格匹配 detail 和 book 表的真实字段
         for (let order of orders) {
             const [details] = await pool.query(`
-                SELECT d.quantity, d.unit_price, b.book_name, b.book_id
+                SELECT
+                    d.quality AS quantity,   -- 你的明细表里存数量的字段叫 quality
+                    b.price AS unit_price,   -- 从 book 表里拿单价
+                    b.bookname AS book_name,
+                    b.bookid AS book_id
                 FROM detail d
-                JOIN book b ON d.book_id = b.book_id
-                WHERE d.sale_id = ?
+                         JOIN book b ON d.bookid = b.bookid
+                WHERE d.saleid = ?
             `, [order.sale_id]);
-            order.items = details;
+
+            order.items = details; // 把查出来的明细塞进订单里返回给前端
         }
+
         res.json({ success: true, data: orders });
     } catch (error) {
-        console.error('获取订单失败:', error);
+        console.error('获取历史订单崩溃:', error.message); // 打印红字方便排错
         res.status(500).json({ success: false, message: 'Server error' });
     }
 });
