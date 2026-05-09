@@ -153,70 +153,74 @@ app.post('/api/cart', async (req, res) => {
 
 // ====== 在 server.js 里面追加这段 ======
 
+// 核心：结算下单 (POST)
 app.post('/api/checkout', async (req, res) => {
+    // 前端发过来的变量名带有下划线，这个我们接收即可
     const { consumer_id } = req.body;
     const connection = await pool.getConnection();
 
     try {
         await connection.beginTransaction();
 
-        // 1. 获取用户信息，查出 vip_level
+        // 🚨 修正1：查用户信息，字段为 consumerid 和 vip
         const [user] = await connection.query(
-            'SELECT vip_level FROM consumer WHERE consumer_id = ?',
+            'SELECT vip FROM consumer WHERE consumerid = ?',
             [consumer_id]
         );
-        const level = user[0]?.vip_level || 0;
+        const level = user[0]?.vip || 0;
 
-        // 2. 核心折扣逻辑：硬编码折扣率 (对应文档中的会员等级)
+        // 折扣逻辑不变
         let discountRate = 1.0;
         if (level === 1) discountRate = 0.95; // 银卡 95折
         else if (level === 2) discountRate = 0.90; // 金卡 90折
         else if (level === 3) discountRate = 0.85; // 钻石 85折
 
-        // 3. 查出购物车商品
+        // 🚨 修正2：查购物车，表名为 shopcar，字段为 consumerid, bookid
         const [cartItems] = await connection.query(`
-            SELECT sc.book_id, sc.quantity, b.price
-            FROM shopping_cart sc
-                     JOIN book b ON sc.book_id = b.book_id
-            WHERE sc.consumer_id = ?
+            SELECT sc.bookid AS book_id, sc.quantity, b.price
+            FROM shopcar sc
+                     JOIN book b ON sc.bookid = b.bookid
+            WHERE sc.consumerid = ?
         `, [consumer_id]);
 
-        if (cartItems.length === 0) throw new Error('Cart is empty');
+        if (cartItems.length === 0) throw new Error('购物车为空');
 
-        // 4. 计算金额：计算原价后再打折
+        // 计算金额
         let subtotal = cartItems.reduce((sum, item) => sum + (item.price * item.quantity), 0);
-        let discountedPrice = subtotal * discountRate; // 应用折扣
-        let totalPrice = discountedPrice + 10; // 加上固定运费 10 元
+        let discountedPrice = subtotal * discountRate;
+        let totalPrice = discountedPrice + 10; // 加运费
 
-        // 5. 写入订单主表 (sale)
+        // 🚨 修正3：写入 sale 表，严格匹配 Navicat 的字段名，并自动写入当前时间 NOW()
         const [saleResult] = await connection.query(`
-            INSERT INTO sale (consumer_id, total_price, paid_amount, payment_status, delivery_status)
-            VALUES (?, ?, ?, '已支付', '未发货') 
-        `, [consumer_id, totalPrice, totalPrice]);
+            INSERT INTO sale (consumerid, totalprice, payprice, ifpay, statu, order_time)
+            VALUES (?, ?, ?, '已支付', '未发货', NOW()) 
+        `, [consumer_id, totalPrice, discountedPrice]);
 
         const saleId = saleResult.insertId;
 
-        // 6. 写入订单明细 (detail) 并扣库存
+        // 🚨 修正4：写入 detail 表，注意你的数量字段叫 quality
         for (const item of cartItems) {
             await connection.query(`
-                INSERT INTO detail (sale_id, book_id, quantity, unit_price)
-                VALUES (?, ?, ?, ?)
-            `, [saleId, item.book_id, item.quantity, item.price * discountRate]); // 记录打折后的单价
+                INSERT INTO detail (saleid, bookid, quality)
+                VALUES (?, ?, ?)
+            `, [saleId, item.book_id, item.quantity]);
 
-            await connection.query(
-                'UPDATE book SET stock = stock - ? WHERE book_id = ?',
-                [item.quantity, item.book_id]
-            );
+            // ⚠️ 如果你在 book 表里加了 stock 字段，请解除下面这三行的注释来扣除库存：
+            // await connection.query(
+            //     'UPDATE book SET stock = stock - ? WHERE bookid = ?',
+            //     [item.quantity, item.book_id]
+            // );
         }
 
-        // 7. 清空购物车
-        await connection.query('DELETE FROM shopping_cart WHERE consumer_id = ?', [consumer_id]);
+        // 🚨 修正5：清空购物车，表名为 shopcar
+        await connection.query('DELETE FROM shopcar WHERE consumerid = ?', [consumer_id]);
 
         await connection.commit();
         res.json({ success: true, message: `结算成功！会员等级：${level}，已享${discountRate * 10}折` });
 
     } catch (error) {
         await connection.rollback();
+        console.error('下单过程崩溃:', error); // 打印红字日志，方便以后排错
         res.status(500).json({ success: false, message: error.message });
     } finally {
         connection.release();
@@ -279,44 +283,31 @@ app.delete('/api/admin/books/:id', async (req, res) => {
     }
 });
 
-// 11. 登录接口 (调试版)
+// 11. 登录接口 (POST)
 app.post('/api/login', async (req, res) => {
     const { username, password, role } = req.body;
-
-    // 🌟 这一行是关键：它会在你的终端控制台打印出前端到底传了什么
-    console.log(`[Login Attempt] Role: ${role}, User: ${username}, Pass: ${password}`);
-
     try {
-        let table = role === 'admin' ? 'admin' : 'consumer';
-        let nameField = role === 'admin' ? 'admin_name' : 'consumer_name';
-        let passField = role === 'admin' ? 'admin_pass' : 'consumer_pass';
+        // 修正：管理员表名叫 adm
+        let table = role === 'admin' ? 'adm' : 'consumer';
+        let nameField = role === 'admin' ? 'admname' : 'consumername';
+        let passField = role === 'admin' ? 'admpass' : 'consumerpass';
 
-        // 打印一下最终生成的 SQL 语句，看看对不对
         const sql = `SELECT * FROM ${table} WHERE ${nameField} = ? AND ${passField} = ?`;
-        console.log(`[Executing SQL] ${sql}`);
-
         const [rows] = await pool.query(sql, [username, password]);
 
         if (rows.length > 0) {
-            console.log('✅ 登录成功！');
             const user = rows[0];
-            const idField = role === 'admin' ? 'admin_id' : 'consumer_id';
-            const nameValue = role === 'admin' ? 'admin_name' : 'consumer_name';
+            const idField = role === 'admin' ? 'admid' : 'consumerid';
+            const nameValue = role === 'admin' ? 'admname' : 'consumername';
 
             res.json({
                 success: true,
-                user: {
-                    id: user[idField],
-                    name: user[nameValue],
-                    role: role
-                }
+                user: { id: user[idField], name: user[nameValue], role: role }
             });
         } else {
-            console.log('❌ 账号或密码不匹配');
             res.status(401).json({ success: false, message: '账号或密码错误' });
         }
     } catch (error) {
-        console.error('🚨 登录接口崩溃:', error);
         res.status(500).json({ success: false, message: '服务器报错' });
     }
 });
@@ -415,20 +406,17 @@ app.post('/api/register', async (req, res) => {
 
 // ====== 在 server.js 里面追加这两段 ======
 
-// 16. 修改购物车商品数量 (PUT)
+// 16. 修改购物车数量 (PUT)
 app.put('/api/cart/:cartId', async (req, res) => {
     const { quantity } = req.body;
     try {
         if (quantity <= 0) {
-            // 如果数量减到 0，直接从购物车删除
-            await pool.query('DELETE FROM shopping_cart WHERE cart_id = ?', [req.params.cartId]);
+            await pool.query('DELETE FROM shopcar WHERE carid = ?', [req.params.cartId]);
         } else {
-            // 否则更新数量
-            await pool.query('UPDATE shopping_cart SET quantity = ? WHERE cart_id = ?', [quantity, req.params.cartId]);
+            await pool.query('UPDATE shopcar SET quantity = ? WHERE carid = ?', [quantity, req.params.cartId]);
         }
         res.json({ success: true, message: '数量已更新' });
     } catch (error) {
-        console.error('更新购物车失败:', error);
         res.status(500).json({ success: false, message: '更新失败' });
     }
 });
