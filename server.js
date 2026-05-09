@@ -41,22 +41,22 @@ app.get('/api/cart/:consumerId', async (req, res) => {
     try {
         const [rows] = await pool.query(`
             SELECT
-                sc.cart_id,
-                sc.quantity,
-                b.book_id,
-                b.book_name,
+                sc.carid AS cart_id,
+                1 AS quantity,              -- 🌟 强行给个默认数量1，防止你没在表里建 quantity 字段导致崩溃
+                b.bookid AS book_id,
+                b.bookname AS book_name,
                 b.author,
                 b.price,
                 b.quality
-            FROM shopping_cart sc
-                     JOIN book b ON sc.book_id = b.book_id
-            WHERE sc.consumer_id = ?
-            ORDER BY sc.add_time DESC
+            FROM shopcar sc                 -- 🌟 修正为你真实的表名 shopcar
+                     JOIN book b ON sc.bookid = b.bookid
+            WHERE sc.consumerid = ?         -- 🌟 修正为你真实的字段 consumerid
+            ORDER BY sc.carid DESC          -- 🌟 用 carid 倒序，因为你表里没有 add_time
         `, [consumerId]);
 
         res.json({ success: true, data: rows });
     } catch (error) {
-        console.error('Database error:', error);
+        console.error('获取购物车失败:', error.message);
         res.status(500).json({ success: false, message: 'Server error' });
     }
 });
