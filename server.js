@@ -425,18 +425,6 @@ app.get('/api/categories', async (req, res) => {
 // 🧑‍🤝‍🧑 客户关系管理 (Consumer Relations) 接口
 // ==========================================
 
-// 1. 获取所有客户列表
-app.get('/api/admin/consumers', async (req, res) => {
-    try {
-        // 查出 consumer 表里的所有数据，按注册时间倒序
-        const [rows] = await pool.query('SELECT * FROM consumer ORDER BY register_time DESC');
-        res.json({ success: true, data: rows });
-    } catch (error) {
-        console.error('获取客户列表失败:', error);
-        res.status(500).json({ success: false, message: '服务器异常' });
-    }
-});
-
 // 2. 获取某个客户的收货地址簿
 app.get('/api/admin/consumers/:id/addresses', async (req, res) => {
     try {
@@ -817,11 +805,6 @@ app.get('/api/orders/user/:userId', async (req, res) => {
     }
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-    console.log(`🚀 Backend server is running on port ${PORT}`);
-});
-
 // 1. 获取所有客户列表 (Admin端专用)
 app.get('/api/admin/consumers', async (req, res) => {
     try {
@@ -886,4 +869,9 @@ app.get('/api/admin/analysis/logistics', async (req, res) => {
             details: error.message
         });
     }
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+    console.log(`🚀 Backend server is running on port ${PORT}`);
 });
