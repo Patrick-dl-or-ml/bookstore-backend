@@ -556,6 +556,24 @@ app.put('/api/admin/orders/:id/dispatch', async (req, res) => {
     }
 });
 
+// 修改订单基础信息 (适配 Navicat 真实字段)
+app.put('/api/admin/orders/:id', async (req, res) => {
+    // 忽略数据库没有的地址和支付方式，只更新时间和状态
+    const { order_time, delivery_status, payment_status } = req.body;
+    try {
+        const sql = `
+            UPDATE sale 
+            SET order_time = ?, statu = ?, ifpay = ? 
+            WHERE saleid = ?
+        `;
+        await pool.query(sql, [order_time, delivery_status, payment_status, req.params.id]);
+        res.json({ success: true, message: '订单基础信息已更新' });
+    } catch (error) {
+        console.error('修改订单基础信息失败:', error.message);
+        res.status(500).json({ success: false, message: '基础信息修改失败' });
+    }
+});
+
 // 5. 修改订单明细数量并自动重算总价 (修复计算逻辑与字段)
 app.put('/api/admin/orders/:saleId/details/:detailId', async (req, res) => {
     const { saleId, detailId } = req.params;
@@ -597,48 +615,36 @@ app.put('/api/admin/orders/:saleId/details/:detailId', async (req, res) => {
 // ==========================================
 // 👤 C端用户：个人中心接口 (User Profile)
 // ==========================================
-
-// 1. 获取用户的个人档案
+// 1. 获取用户的个人档案 (使用 AS 映射)
 app.get('/api/users/:id/profile', async (req, res) => {
     try {
-        const [rows] = await pool.query('SELECT * FROM consumer WHERE consumer_id = ?', [req.params.id]);
+        const [rows] = await pool.query(`
+            SELECT consumerid AS consumer_id, consumername AS consumer_name, email, vip AS vip_level, integral, balance 
+            FROM consumer WHERE consumerid = ?
+        `, [req.params.id]);
+
         if (rows.length > 0) {
-            // 把密码剔除，保护隐私
-            const { consumer_pass, ...safeData } = rows[0];
-            res.json({ success: true, data: safeData });
+            res.json({ success: true, data: rows[0] });
         } else {
             res.json({ success: false, message: '用户不存在' });
         }
     } catch (error) {
-        console.error('获取个人信息失败:', error);
+        console.error('获取个人信息失败:', error.message);
         res.status(500).json({ success: false, message: '服务器异常' });
     }
 });
 
-// 2. 用户修改自己的个人信息
+// 2. 用户修改自己的个人信息 (剔除数据库没有的 phone 字段)
 app.put('/api/users/:id/profile', async (req, res) => {
-    const { consumer_name, email, phone } = req.body;
+    const { consumer_name, email } = req.body; // 不要接收 phone，因为数据库没这个列
     try {
-        // C端用户只能改这三个字段，绝不能让他们自己改 vip_level 和 integral！
         await pool.query(
-            'UPDATE consumer SET consumer_name = ?, email = ?, phone = ? WHERE consumer_id = ?',
-            [consumer_name, email, phone, req.params.id]
+            'UPDATE consumer SET consumername = ?, email = ? WHERE consumerid = ?',
+            [consumer_name, email, req.params.id]
         );
         res.json({ success: true, message: '个人资料更新成功' });
     } catch (error) {
-        console.error('更新个人信息失败:', error);
-        res.status(500).json({ success: false, message: '服务器异常' });
-    }
-});
-
-// 3. 用户查询自己的专属订单
-app.get('/api/users/:id/orders', async (req, res) => {
-    try {
-        // 只能查 consumer_id 是自己的订单
-        const [rows] = await pool.query('SELECT * FROM sale WHERE consumer_id = ? ORDER BY order_time DESC', [req.params.id]);
-        res.json({ success: true, data: rows });
-    } catch (error) {
-        console.error('获取我的订单失败:', error);
+        console.error('更新个人信息失败:', error.message);
         res.status(500).json({ success: false, message: '服务器异常' });
     }
 });
@@ -718,16 +724,17 @@ app.get('/api/admin/dashboard/stats', async (req, res) => {
     }
 });
 
-// 19. 获取库存预警列表 (对应文档 3.1.2 需求)[cite: 1]
+// 19. 获取库存预警列表 (映射正确的 bookid 和 bookname)
 app.get('/api/admin/inventory/warning', async (req, res) => {
     try {
-        // 查找库存低于 10 本的图书[cite: 1]
-        const [rows] = await pool.query('SELECT book_id, book_name, stock FROM book WHERE stock < 5 ORDER BY stock ASC');
+        const [rows] = await pool.query('SELECT bookid AS book_id, bookname AS book_name, stock FROM book WHERE stock < 5 ORDER BY stock ASC');
         res.json({ success: true, data: rows });
     } catch (error) {
+        console.error('获取库存预警失败:', error.message);
         res.status(500).json({ success: false, message: '获取预警失败' });
     }
 });
+
 
 app.get('/api/admin/analysis/category', async (req, res) => {
     try {
