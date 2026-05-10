@@ -258,21 +258,6 @@ app.get('/api/user/:id/orders', async (req, res) => {
 
 // ====== 在 server.js 里面追加这段 ======
 
-// 9. 管理员：上架新书 (POST)
-app.post('/api/admin/books', async (req, res) => {
-    const { book_name, author, isbn, price, stock, quality, category_id } = req.body;
-    try {
-        await pool.query(
-            'INSERT INTO book (book_name, author, isbn, price, stock, quality, category_id, status) VALUES (?, ?, ?, ?, ?, ?, ?, "上架")',
-            [book_name, author, isbn, price, stock, quality, category_id]
-        );
-        res.json({ success: true, message: 'Book added successfully!' });
-    } catch (error) {
-        console.error(error);
-        res.status(500).json({ success: false, message: 'Failed to add book' });
-    }
-});
-
 // 11. 登录接口 (POST)
 app.post('/api/login', async (req, res) => {
     const { username, password, role } = req.body;
@@ -304,22 +289,42 @@ app.post('/api/login', async (req, res) => {
 
 // ====== 在 server.js 里面追加这段 ======
 
-// 12. 管理员：上架新书 (POST)
+// 📚 Admin: 上架新书 (POST) - 唯一正确版
 app.post('/api/admin/books', async (req, res) => {
-    const { book_name, author, isbn, price, stock, quality, category_id } = req.body;
+    // 接收前端发来的数据
+    const { book_name, author, isbn, price, stock, category_id } = req.body;
+
     try {
-        // 这里的 category_id 默认为 1（一般是“未分类”或“通用”）
+        // 🚨 核心修复 1：前端传的是 category_id，我们需要去 categories 表里把它“翻译”成文字
+        let catName = '综合';
+        if (category_id) {
+            const [cats] = await pool.query('SELECT category_name FROM categories WHERE category_id = ?', [category_id]);
+            if (cats.length > 0) {
+                catName = cats[0].category_name;
+            } else {
+                catName = category_id; // 兜底：万一前端传的就是文字，直接用
+            }
+        }
+
+        // 🚨 核心修复 2：严格对齐 book 表的字段 (bookname, categoryname, stock 等)
         await pool.query(
-            'INSERT INTO book (book_name, author, isbn, price, stock, quality, category_id, status) VALUES (?, ?, ?, ?, ?, ?, ?, "上架")',
-            [book_name, author, isbn, price, stock, quality, category_id || 1]
+            'INSERT INTO book (bookname, author, isbn, price, stock, quality, categoryname) VALUES (?, ?, ?, ?, ?, ?, ?)',
+            [
+                book_name,
+                author || '佚名',               // 兜底：前端没传作者，就填'佚名'
+                isbn || `SYS-${Date.now()}`,    // 兜底：前端没传ISBN，自动生成
+                price || 0,
+                stock || 0,
+                '全新',                         // 兜底：默认新书
+                catName                         // 插入翻译好的文字分类名
+            ]
         );
-        res.json({ success: true, message: '书籍上架成功！' });
+        res.json({ success: true, message: '新书上架成功！' });
     } catch (error) {
-        console.error('上架失败:', error);
-        res.status(500).json({ success: false, message: '上架失败，请检查字段' });
+        console.error('上架新书崩溃:', error.message);
+        res.status(500).json({ success: false, message: '服务器异常' });
     }
 });
-
 // 📚 Admin: 终极删除/下架图书 (唯一正确版，全场只能有这一个)
 app.delete('/api/admin/books/:id', async (req, res) => {
     const bookId = req.params.id;
