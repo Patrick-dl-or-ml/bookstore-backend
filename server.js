@@ -35,6 +35,7 @@ app.get('/', (req, res) => {
     res.status(200).send('API is awake and running!');
 });
 
+
 // 2. 获取购物车列表接口
 app.get('/api/cart/:consumerId', async (req, res) => {
     const { consumerId } = req.params;
@@ -42,22 +43,37 @@ app.get('/api/cart/:consumerId', async (req, res) => {
         const [rows] = await pool.query(`
             SELECT
                 sc.carid AS cart_id,
-                1 AS quantity,              -- 🌟 强行给个默认数量1，防止你没在表里建 quantity 字段导致崩溃
+                sc.quantity AS quantity,    -- 🌟 终于可以使用真实的库存数量了！
                 b.bookid AS book_id,
                 b.bookname AS book_name,
                 b.author,
                 b.price,
                 b.quality
-            FROM shopcar sc                 -- 🌟 修正为你真实的表名 shopcar
+            FROM shopcar sc
                      JOIN book b ON sc.bookid = b.bookid
-            WHERE sc.consumerid = ?         -- 🌟 修正为你真实的字段 consumerid
-            ORDER BY sc.carid DESC          -- 🌟 用 carid 倒序，因为你表里没有 add_time
+            WHERE sc.consumerid = ?
+            ORDER BY sc.carid DESC
         `, [consumerId]);
-
         res.json({ success: true, data: rows });
     } catch (error) {
-        console.error('获取购物车失败:', error.message);
         res.status(500).json({ success: false, message: 'Server error' });
+    }
+});
+
+// 🌟 补充丢失的接口：修改/删除购物车商品 (PUT)
+app.put('/api/cart/:cartId', async (req, res) => {
+    const { quantity } = req.body;
+    try {
+        if (quantity <= 0) {
+            // 数量减到0或以下，直接从购物车删除
+            await pool.query('DELETE FROM shopcar WHERE carid = ?', [req.params.cartId]);
+        } else {
+            // 更新数量
+            await pool.query('UPDATE shopcar SET quantity = ? WHERE carid = ?', [quantity, req.params.cartId]);
+        }
+        res.json({ success: true, message: '数量已更新' });
+    } catch (error) {
+        res.status(500).json({ success: false, message: '更新失败' });
     }
 });
 
@@ -229,35 +245,6 @@ app.post('/api/checkout', async (req, res) => {
 
 // ====== 在 server.js 里面追加这段 ======
 
-// 7. 获取个人基本信息 (查询 consumer 表)
-app.get('/api/user/:id', async (req, res) => {
-    try {
-        const [rows] = await pool.query('SELECT * FROM consumer WHERE consumer_id = ?', [req.params.id]);
-        if (rows.length > 0) {
-            res.json({ success: true, data: rows[0] });
-        } else {
-            res.status(404).json({ success: false, message: 'User not found' });
-        }
-    } catch (error) {
-        res.status(500).json({ success: false, message: 'Server error' });
-    }
-});
-
-// 8. 获取该用户的历史订单 (查询 sale 表)
-app.get('/api/user/:id/orders', async (req, res) => {
-    try {
-        const [rows] = await pool.query(
-            'SELECT * FROM sale WHERE consumer_id = ? ORDER BY order_time DESC',
-            [req.params.id]
-        );
-        res.json({ success: true, data: rows });
-    } catch (error) {
-        res.status(500).json({ success: false, message: 'Server error' });
-    }
-});
-
-// ====== 在 server.js 里面追加这段 ======
-
 // 11. 登录接口 (POST)
 app.post('/api/login', async (req, res) => {
     const { username, password, role } = req.body;
@@ -367,19 +354,19 @@ app.put('/api/admin/books/:id', async (req, res) => {
 
 // ====== 在 server.js 里面追加这段 ======
 
-// 15. 新用户注册接口 (POST) - 完备版 (对标需求文档 3.2.1)
+// 15. 新用户注册接口 (POST) - 完备版
 app.post('/api/register', async (req, res) => {
-    const { username, password, email, phone } = req.body;
+    const { username, password, email } = req.body; // 🚨 剔除前端传来的 phone
     try {
-        const [exist] = await pool.query('SELECT * FROM consumer WHERE consumer_name = ?', [username]);
+        const [exist] = await pool.query('SELECT * FROM consumer WHERE consumername = ?', [username]);
         if (exist.length > 0) {
             return res.status(400).json({ success: false, message: '该用户名已被注册，请换一个' });
         }
 
-        // 🌟 核心改进：记录注册时间 NOW() 和初始余额 0
+        // 🚨 严格对齐字段名：consumername, consumerpass, vip
         const [result] = await pool.query(
-            'INSERT INTO consumer (consumer_name, consumer_pass, email, phone, vip_level, integral, balance, register_time) VALUES (?, ?, ?, ?, 0, 0, 0, NOW())',
-            [username, password, email, phone]
+            'INSERT INTO consumer (consumername, consumerpass, email, vip, integral, balance, register_time) VALUES (?, ?, ?, 0, 0, 0, NOW())',
+            [username, password, email]
         );
 
         res.json({
@@ -388,20 +375,8 @@ app.post('/api/register', async (req, res) => {
             user: { id: result.insertId, name: username, role: 'user' }
         });
     } catch (error) {
-        console.error('注册失败:', error);
+        console.error('注册失败:', error.message);
         res.status(500).json({ success: false, message: '服务器开小差了，注册失败' });
-    }
-});
-
-
-// 17. 管理员：订单发货 (PUT)
-app.put('/api/admin/orders/:id/deliver', async (req, res) => {
-    try {
-        await pool.query("UPDATE sale SET delivery_status = '已发货' WHERE sale_id = ?", [req.params.id]);
-        res.json({ success: true, message: '发货成功！' });
-    } catch (error) {
-        console.error('发货失败:', error);
-        res.status(500).json({ success: false, message: '操作失败' });
     }
 });
 
@@ -436,42 +411,37 @@ app.get('/api/admin/consumers/:id/addresses', async (req, res) => {
     }
 });
 
-// 3. 修改客户信息 (对标 3.2.1：支持修改电话、等级、余额等)
+// 3. 修改客户信息
 app.put('/api/admin/consumers/:id', async (req, res) => {
-    // 🌟 增加接收 balance 字段
-    const { consumer_name, email, phone, vip_level, integral, balance } = req.body;
-
+    const { consumer_name, email, vip_level, integral, balance } = req.body; // 去掉 phone
     try {
+        // 🚨 严格对齐：consumername, vip, consumerid
         const sql = `
-            UPDATE consumer 
-            SET consumer_name = ?, email = ?, phone = ?, vip_level = ?, integral = ?, balance = ? 
-            WHERE consumer_id = ?
+            UPDATE consumer
+            SET consumername = ?, email = ?, vip = ?, integral = ?, balance = ?
+            WHERE consumerid = ?
         `;
-        await pool.query(sql, [consumer_name, email, phone, vip_level, integral, balance, req.params.id]);
+        await pool.query(sql, [consumer_name, email, vip_level, integral, balance, req.params.id]);
         res.json({ success: true, message: '客户资料已更新' });
     } catch (error) {
-        console.error('修改客户资料失败:', error);
+        console.error('修改客户资料失败:', error.message);
         res.status(500).json({ success: false, message: '服务器异常，修改失败' });
     }
 });
 
-// 3.5 删除客户 (增加“无订单记录”安全检查[cite: 1])
+// 3.5 删除客户 (增加“无订单记录”安全检查)
 app.delete('/api/admin/consumers/:id', async (req, res) => {
     const userId = req.params.id;
     try {
-        // 第一步：安全检查，有订单记录的客户不许删[cite: 1]
-        const [orders] = await pool.query('SELECT sale_id FROM sale WHERE consumer_id = ?', [userId]);
+        // 🚨 严格对齐：saleid, consumerid
+        const [orders] = await pool.query('SELECT saleid FROM sale WHERE consumerid = ?', [userId]);
         if (orders.length > 0) {
-            return res.status(400).json({
-                success: false,
-                message: '该客户存在历史订单记录，为保护财务数据无法物理注销'
-            });
+            return res.status(400).json({ success: false, message: '该客户存在历史订单记录，无法注销' });
         }
-        // 第二步：没订单才允许删
-        await pool.query('DELETE FROM consumer WHERE consumer_id = ?', [userId]);
+        await pool.query('DELETE FROM consumer WHERE consumerid = ?', [userId]);
         res.json({ success: true, message: '客户账号已成功注销' });
     } catch (error) {
-        console.error('注销客户失败:', error);
+        console.error('注销客户失败:', error.message);
         res.status(500).json({ success: false, message: '服务器忙，请稍后再试' });
     }
 });
