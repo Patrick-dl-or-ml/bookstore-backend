@@ -340,20 +340,21 @@ app.delete('/api/admin/books/:id', async (req, res) => {
 
 // ====== 在 server.js 里面追加这段 ======
 
-// 14. 管理员：修改图书信息 (PUT)
+// 14. Admin: 修改图书信息 (PUT)
 app.put('/api/admin/books/:id', async (req, res) => {
-    // 🌟 修复点 1：在这里接收前端传来的 category_id
-    const { price, stock, book_name, author, category_id } = req.body;
+    // 接收前端表单传来的数据（前端传的是什么名字，这里就原样接收）
+    const { book_name, author, price, stock } = req.body;
 
     try {
+        // 🚨 核心修复：SQL 语句里的列名必须完全等于 Navicat 里的名字 (bookname, bookid)
+        // 并且去掉了不存在的 category_id
         await pool.query(
-            // 🌟 修复点 2：把 category_id = ? 加进 SQL 语句中
-            'UPDATE book SET book_name = ?, author = ?, price = ?, stock = ?, category_id = ? WHERE book_id = ?',
-            [book_name, author, price, stock, category_id, req.params.id]
+            'UPDATE book SET bookname = ?, author = ?, price = ?, stock = ? WHERE bookid = ?',
+            [book_name, author || '', price, stock, req.params.id]
         );
         res.json({ success: true, message: '图书修改成功！' });
     } catch (error) {
-        console.error('修改失败:', error);
+        console.error('修改图书信息崩溃:', error.message);
         res.status(500).json({ success: false, message: '修改失败' });
     }
 });
