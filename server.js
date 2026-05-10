@@ -214,18 +214,18 @@ app.post('/api/checkout', async (req, res) => {
 
         const saleId = saleResult.insertId;
 
-        // 🚨 修正4：写入 detail 表，注意你的数量字段叫 quality
+        // 🚨 修正4：写入 detail 表，并真正执行扣除库存
         for (const item of cartItems) {
             await connection.query(`
                 INSERT INTO detail (saleid, bookid, quality)
                 VALUES (?, ?, ?)
             `, [saleId, item.book_id, item.quantity]);
 
-            // ⚠️ 如果你在 book 表里加了 stock 字段，请解除下面这三行的注释来扣除库存：
-            // await connection.query(
-            //     'UPDATE book SET stock = stock - ? WHERE bookid = ?',
-            //     [item.quantity, item.book_id]
-            // );
+            // 🌟 解除封印：这句 SQL 终于可以真正扣除库存了！
+            await connection.query(
+                'UPDATE book SET stock = stock - ? WHERE bookid = ?',
+                [item.quantity, item.book_id]
+            );
         }
 
         // 🚨 修正5：清空购物车，表名为 shopcar
@@ -496,16 +496,26 @@ app.get('/api/admin/orders/:id/details', async (req, res) => {
     }
 });
 
-// 3. 级联删除订单 (修复字段名报错)
+// 3. 级联删除订单，并自动退回库存
 app.delete('/api/admin/orders/:id', async (req, res) => {
     const saleId = req.params.id;
     const connection = await pool.getConnection();
     try {
         await connection.beginTransaction();
+
+        // 🌟 新增逻辑：在删除明细之前，先把这些书的库存“还”回去
+        const [items] = await connection.query('SELECT bookid, quality FROM detail WHERE saleid = ?', [saleId]);
+        for (let item of items) {
+            // quality 就是你表里的数量，把它加回 stock 里
+            await connection.query('UPDATE book SET stock = stock + ? WHERE bookid = ?', [item.quality, item.bookid]);
+        }
+
+        // 退完库存后，正常删除明细和主订单
         await connection.query('DELETE FROM detail WHERE saleid = ?', [saleId]);
         await connection.query('DELETE FROM sale WHERE saleid = ?', [saleId]);
+
         await connection.commit();
-        res.json({ success: true, message: '订单彻底删除' });
+        res.json({ success: true, message: '订单已删除，库存已成功退回仓库！' });
     } catch (error) {
         await connection.rollback();
         console.error('删除订单崩溃:', error.message);
