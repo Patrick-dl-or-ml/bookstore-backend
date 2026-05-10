@@ -481,86 +481,83 @@ app.delete('/api/admin/consumers/:id', async (req, res) => {
 // 📦 订单履约中心 (Order Command Center) 接口
 // ==========================================
 
-// --- 修复高额订单监控接口 ---
+// 1. 获取订单列表 (修复 Invalid Date 和状态丢失)
 app.get('/api/admin/orders', async (req, res) => {
     try {
         const sql = `
             SELECT
-                s.saleid as sale_id,      -- 🌟 对应你表里的 saleid
-                s.totalprice as total_price, -- 🌟 对应你表里的 totalprice
-                c.consumername as consumer_name -- 🌟 对应你表里的 consumername
+                s.saleid AS sale_id,
+                s.totalprice AS total_price,
+                s.ifpay AS payment_status,
+                s.statu AS delivery_status,
+                s.order_time AS order_time,
+                c.consumername AS consumer_name
             FROM sale s
                      JOIN consumer c ON s.consumerid = c.consumerid
             ORDER BY s.saleid DESC
         `;
         const [rows] = await pool.query(sql);
-
-        // 即使没有数据，也要返回一个空数组，防止前端报错
-        res.json({
-            success: true,
-            data: rows || []
-        });
+        res.json({ success: true, data: rows || [] });
     } catch (error) {
-        console.error('orders 接口崩溃:', error);
-        res.status(500).json({
-            success: false,
-            message: '无法获取订单列表',
-            details: error.message
-        });
+        console.error('获取订单列表崩溃:', error.message);
+        res.status(500).json({ success: false, message: '无法获取订单列表' });
     }
 });
 
-// 2. 获取订单明细 (保留原有逻辑)
+// 2. 获取订单明细 (修复无限 Loading)
 app.get('/api/admin/orders/:id/details', async (req, res) => {
     try {
-        const [rows] = await pool.query(`
-            SELECT d.*, b.book_name, b.author
+        const sql = `
+            SELECT 
+                d.detailid AS detail_id, 
+                d.bookid AS book_id, 
+                d.quality AS quantity,   -- 🚨 数据库存数量的字段叫 quality
+                b.price AS unit_price,   -- 从 book 表联查单价
+                b.bookname AS book_name, 
+                b.author
             FROM detail d
-                     JOIN book b ON d.book_id = b.book_id
-            WHERE d.sale_id = ?
-        `, [req.params.id]);
+            JOIN book b ON d.bookid = b.bookid
+            WHERE d.saleid = ?
+        `;
+        const [rows] = await pool.query(sql, [req.params.id]);
         res.json({ success: true, data: rows });
     } catch (error) {
+        console.error('获取订单明细崩溃:', error.message);
         res.status(500).json({ success: false, message: '服务器异常' });
     }
 });
 
-// 3. 级联删除订单：删除订单及其关联的所有明细 (对标 3.2.2.1)
+// 3. 级联删除订单 (修复字段名报错)
 app.delete('/api/admin/orders/:id', async (req, res) => {
     const saleId = req.params.id;
     const connection = await pool.getConnection();
     try {
         await connection.beginTransaction();
-        await connection.query('DELETE FROM detail WHERE sale_id = ?', [saleId]);
-        await connection.query('DELETE FROM sale WHERE sale_id = ?', [saleId]);
+        await connection.query('DELETE FROM detail WHERE saleid = ?', [saleId]);
+        await connection.query('DELETE FROM sale WHERE saleid = ?', [saleId]);
         await connection.commit();
-        res.json({ success: true, message: '订单及其明细已彻底级联删除' });
+        res.json({ success: true, message: '订单彻底删除' });
     } catch (error) {
         await connection.rollback();
+        console.error('删除订单崩溃:', error.message);
         res.status(500).json({ success: false, message: '删除失败' });
     } finally {
         connection.release();
     }
 });
 
-// 4. 修改订单基础信息 (日期、地址、支付状态)
-app.put('/api/admin/orders/:id', async (req, res) => {
-    const { order_time, payment_method, delivery_address, delivery_status, payment_status } = req.body;
+// 4. 订单发货 (前端调用的是 /dispatch 路径)
+app.put('/api/admin/orders/:id/dispatch', async (req, res) => {
     try {
-        const sql = `
-            UPDATE sale 
-            SET order_time = ?, payment_method = ?, delivery_address = ?, 
-                delivery_status = ?, payment_status = ? 
-            WHERE sale_id = ?
-        `;
-        await pool.query(sql, [order_time, payment_method, delivery_address, delivery_status, payment_status, req.params.id]);
-        res.json({ success: true, message: '订单基础信息已更新' });
+        await pool.query("UPDATE sale SET statu = '已发货' WHERE saleid = ?", [req.params.id]);
+        res.json({ success: true, message: '发货成功！' });
     } catch (error) {
-        res.status(500).json({ success: false, message: '基础信息修改失败' });
+        console.error('发货失败:', error.message);
+        res.status(500).json({ success: false, message: '操作失败' });
     }
 });
 
-// 5. 核心逻辑：修改明细数量并自动重算订单总额 (对标 3.2.2.1)
+// 5. 修改订单明细数量并自动重算总价 (修复计算逻辑与字段)
 app.put('/api/admin/orders/:saleId/details/:detailId', async (req, res) => {
     const { saleId, detailId } = req.params;
     const { quantity } = req.body;
@@ -568,25 +565,36 @@ app.put('/api/admin/orders/:saleId/details/:detailId', async (req, res) => {
 
     try {
         await connection.beginTransaction();
-        const [detail] = await connection.query('SELECT unit_price FROM detail WHERE detail_id = ?', [detailId]);
-        if (detail.length === 0) throw new Error('明细不存在');
 
-        await connection.query('UPDATE detail SET quantity = ? WHERE detail_id = ?', [quantity, detailId]);
+        // 更新 detail 表的 quantity (数据库里叫 quality)
+        await connection.query('UPDATE detail SET quality = ? WHERE detailid = ?', [quantity, detailId]);
 
-        // 重新汇总金额 + 10元固定运费[cite: 1]
-        const [allDetails] = await connection.query('SELECT SUM(quantity * unit_price) as subtotal FROM detail WHERE sale_id = ?', [saleId]);
-        const newTotal = (allDetails[0].subtotal || 0) + 10;
+        // 重新计算该订单的总价: SUM(数量 * 书本单价)
+        const [allDetails] = await connection.query(`
+            SELECT SUM(d.quality * b.price) as subtotal 
+            FROM detail d
+            JOIN book b ON d.bookid = b.bookid
+            WHERE d.saleid = ?
+        `, [saleId]);
 
-        await connection.query('UPDATE sale SET total_price = ? WHERE sale_id = ?', [newTotal, saleId]);
+        const newTotal = (allDetails[0].subtotal || 0) + 10; // 加上 10 元运费
+
+        // 更新 sale 表的 totalprice
+        await connection.query('UPDATE sale SET totalprice = ? WHERE saleid = ?', [newTotal, saleId]);
+
         await connection.commit();
-        res.json({ success: true, message: '明细已调整，订单总额已自动同步重算', newTotal });
+        res.json({ success: true, newTotal });
     } catch (error) {
         await connection.rollback();
+        console.error('修改数量崩溃:', error.message);
         res.status(500).json({ success: false, message: error.message });
     } finally {
         connection.release();
     }
 });
+
+
+
 // ==========================================
 // 👤 C端用户：个人中心接口 (User Profile)
 // ==========================================
