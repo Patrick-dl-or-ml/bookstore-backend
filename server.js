@@ -64,15 +64,15 @@ app.get('/api/cart/:consumerId', async (req, res) => {
 // 4. 获取图书列表 (适配你的数据库字段：quality, categoryname)
 app.get('/api/books', async (req, res) => {
     const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 12; // 商店一页多显示点
+    const limit = parseInt(req.query.limit) || 12;
     const offset = (page - 1) * limit;
 
     const keyword = req.query.keyword;
     const category = req.query.category;
 
     try {
-        // 注意：这里去掉了 LEFT JOIN，直接查 book 表里的 categoryname
-        let baseSql = ` FROM book WHERE 1=1 `;
+        // 🌟 核心修复 1：加上 stock >= 0 的条件。如果库存被设为 -1，说明被软删除了，不再显示！
+        let baseSql = ` FROM book WHERE stock >= 0 `;
         let params = [];
 
         if (keyword) {
@@ -88,19 +88,19 @@ app.get('/api/books', async (req, res) => {
         const [countResult] = await pool.query(`SELECT COUNT(*) as total ${baseSql}`, params);
         const total = countResult[0].total;
 
-        // 🌟 核心修复：用 AS 把数据库的列名映射成前端需要的变量名，并伪造一个 stock 库存
+        // 🌟 核心修复 2：把 50 AS stock 换成真实的 stock！
         const dataSql = `
-    SELECT 
-        bookid AS book_id, 
-        bookname AS book_name, 
-        author, 
-        isbn, 
-        categoryname AS category_name, 
-        quality, 
-        price, 
-        50 AS stock 
-    ${baseSql} ORDER BY bookid DESC LIMIT ? OFFSET ?
-`;
+            SELECT 
+                bookid AS book_id, 
+                bookname AS book_name, 
+                author, 
+                isbn, 
+                categoryname AS category_name, 
+                quality, 
+                price, 
+                stock     -- 👈 这里不再写死 50，直接读取真实库存
+            ${baseSql} ORDER BY bookid DESC LIMIT ? OFFSET ?
+        `;
         const [rows] = await pool.query(dataSql, [...params, limit, offset]);
 
         res.json({
@@ -324,22 +324,15 @@ app.post('/api/admin/books', async (req, res) => {
 app.delete('/api/admin/books/:id', async (req, res) => {
     const bookId = req.params.id;
     try {
-        // 第一步：清空购物车里的外键关联
         await pool.query('DELETE FROM shopcar WHERE bookid = ?', [bookId]);
-
-        // 第二步：尝试物理删除 (字段名必须是 bookid)
         await pool.query('DELETE FROM book WHERE bookid = ?', [bookId]);
-
         res.json({ success: true, message: '书籍彻底物理删除成功！' });
     } catch (error) {
-        console.log('有历史订单，物理删除被拦截，进入软下架流程:', error.message);
-
-        // 第三步：降级方案 -> 软下架 (库存清零)
+        // 🌟 核心修复 3：把库存设为 -1，当作“已下架/已删除”的标记
         try {
-            await pool.query('UPDATE book SET stock = 0 WHERE bookid = ?', [bookId]);
-            res.json({ success: true, message: '已作为历史资产保留，并强制清空库存下架！' });
+            await pool.query('UPDATE book SET stock = -1 WHERE bookid = ?', [bookId]);
+            res.json({ success: true, message: '该书有交易记录，已转为软下架隐藏！' });
         } catch (err2) {
-            console.error('软下架也报错了:', err2.message);
             res.status(500).json({ success: false, message: '服务器彻底罢工了' });
         }
     }
