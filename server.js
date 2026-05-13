@@ -232,6 +232,22 @@ app.post('/api/checkout', async (req, res) => {
         // 🚨 修正5：清空购物车，表名为 shopping_cart
         await connection.query('DELETE FROM shopping_cart WHERE consumer_id = ?', [consumer_id]);
 
+        // ====== 🌟 新增小功能：积分赠送与 VIP 自动升级 ======
+        const earnedPoints = Math.floor(discountedPrice); // 1元=1积分，向下取整
+
+        // 利用 MySQL 的 CASE WHEN 实现无缝的阶梯升级逻辑
+        await connection.query(`
+            UPDATE consumer 
+            SET integral = integral + ?,
+                vip_level = CASE
+                    WHEN integral + ? >= 5000 THEN 3  -- 满5000分升钻石(3)
+                    WHEN integral + ? >= 2000 THEN 2  -- 满2000分升金卡(2)
+                    WHEN integral + ? >= 500 THEN 1   -- 满500分升银卡(1)
+                    ELSE vip_level 
+                END
+            WHERE consumer_id = ?
+        `, [earnedPoints, earnedPoints, earnedPoints, earnedPoints, consumer_id]);
+
         await connection.commit();
         res.json({ success: true, message: `结算成功！会员等级：${level}，已享${discountRate * 10}折` });
 
@@ -244,7 +260,54 @@ app.post('/api/checkout', async (req, res) => {
     }
 });
 
-// ====== 在 server.js 里面追加这段 ======
+// 🌟 新增小功能：猜你喜欢 (同类书籍推荐)
+app.get('/api/books/:id/related', async (req, res) => {
+    try {
+        const bookId = req.params.id;
+
+        // 核心逻辑：先查出这本书的分类，然后再查同分类下的其他书，按 RAND() 随机打乱取 4 本
+        const sql = `
+            SELECT book_id, book_name, author, price, cover_img 
+            FROM book 
+            WHERE category_id = (SELECT category_id FROM book WHERE book_id = ?) 
+              AND book_id != ? 
+              AND stock > 0
+            ORDER BY RAND() 
+            LIMIT 4
+        `;
+        const [rows] = await pool.query(sql, [bookId, bookId]);
+
+        res.json({ success: true, data: rows });
+    } catch (error) {
+        console.error('推荐书籍获取失败:', error.message);
+        res.status(500).json({ success: false, message: 'Server error' });
+    }
+});
+
+// 🌟 新增小功能：我的数字书架 (已购图书去重列表)
+app.get('/api/users/:userId/bookshelf', async (req, res) => {
+    try {
+        // 核心逻辑：订单表关联明细表再关联图书表，只要支付成功就算买过，并用 DISTINCT 去重
+        const sql = `
+            SELECT DISTINCT
+                b.book_id,
+                b.book_name,
+                b.author,
+                b.isbn
+            FROM sale s
+            JOIN detail d ON s.sale_id = d.sale_id
+            JOIN book b ON d.book_id = b.book_id
+            WHERE s.consumer_id = ? AND s.payment_status = '已支付'
+            ORDER BY b.book_id DESC
+        `;
+        const [rows] = await pool.query(sql, [req.params.userId]);
+
+        res.json({ success: true, data: rows });
+    } catch (error) {
+        console.error('获取书架失败:', error.message);
+        res.status(500).json({ success: false, message: 'Server error' });
+    }
+});
 
 // 11. 登录接口 (POST)
 app.post('/api/login', async (req, res) => {
