@@ -864,17 +864,17 @@ app.get('/api/admin/consumers', async (req, res) => {
         res.status(500).json({ success: false, message: '服务器异常' });
     }
 });
-
 // 1. 获取核心客户贡献榜 (修复 404 丢失问题)
 app.get('/api/admin/analysis/top-customers', async (req, res) => {
     try {
+        // 🚨 修正：严格对齐新表的 consumer_name, total_price, consumer_id
         const sql = `
             SELECT
-                c.consumername AS consumer_name,
-                SUM(s.totalprice) AS total_spent
+                c.consumer_name AS consumer_name,
+                SUM(s.total_price) AS total_spent
             FROM sale s
-                     JOIN consumer c ON s.consumerid = c.consumerid
-            GROUP BY c.consumerid, c.consumername
+                     JOIN consumer c ON s.consumer_id = c.consumer_id
+            GROUP BY c.consumer_id, c.consumer_name
             ORDER BY total_spent DESC
                 LIMIT 5
         `;
@@ -889,13 +889,15 @@ app.get('/api/admin/analysis/top-customers', async (req, res) => {
 // 2. 获取畅销书榜单 (修复字段名映射)
 app.get('/api/admin/analysis/top-books', async (req, res) => {
     try {
+        // 🚨 修正：bookname -> book_name, bookid -> book_id
+        // 🌟 彻底消灭 quality！使用正确的 quantity 字段统计销量
         const sql = `
             SELECT
-                b.bookname AS book_name,
-                SUM(d.quality) AS total_sold    -- 🚨 注意：你的数量字段叫 quality
+                b.book_name AS book_name,
+                SUM(d.quantity) AS total_sold
             FROM detail d
-                     JOIN book b ON d.bookid = b.bookid
-            GROUP BY b.bookid, b.bookname
+                     JOIN book b ON d.book_id = b.book_id
+            GROUP BY b.book_id, b.book_name
             ORDER BY total_sold DESC
                 LIMIT 5
         `;
@@ -910,12 +912,13 @@ app.get('/api/admin/analysis/top-books', async (req, res) => {
 // 3. 获取物流状态分布
 app.get('/api/admin/analysis/logistics', async (req, res) => {
     try {
+        // 🚨 修正：statu 变更为 delivery_status
         const sql = `
             SELECT
-                statu AS delivery_status,       -- 🚨 映射 statu 为 delivery_status
+                delivery_status AS delivery_status,
                 COUNT(*) AS count
             FROM sale
-            GROUP BY statu
+            GROUP BY delivery_status
         `;
         const [rows] = await pool.query(sql);
         res.json({ success: true, data: rows });
