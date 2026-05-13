@@ -40,19 +40,20 @@ app.get('/', (req, res) => {
 app.get('/api/cart/:consumerId', async (req, res) => {
     const { consumerId } = req.params;
     try {
+        // 🚨 修正：shopcar -> shopping_cart，更新相应的字段名
         const [rows] = await pool.query(`
             SELECT
-                sc.carid AS cart_id,
+                sc.cart_id AS cart_id,
                 sc.quantity AS quantity,    -- 🌟 终于可以使用真实的库存数量了！
-                b.bookid AS book_id,
-                b.bookname AS book_name,
+                b.book_id AS book_id,
+                b.book_name AS book_name,
                 b.author,
                 b.price,
                 b.quality
-            FROM shopcar sc
-                     JOIN book b ON sc.bookid = b.bookid
-            WHERE sc.consumerid = ?
-            ORDER BY sc.carid DESC
+            FROM shopping_cart sc
+                     JOIN book b ON sc.book_id = b.book_id
+            WHERE sc.consumer_id = ?
+            ORDER BY sc.cart_id DESC
         `, [consumerId]);
         res.json({ success: true, data: rows });
     } catch (error) {
@@ -66,10 +67,10 @@ app.put('/api/cart/:cartId', async (req, res) => {
     try {
         if (quantity <= 0) {
             // 数量减到0或以下，直接从购物车删除
-            await pool.query('DELETE FROM shopcar WHERE carid = ?', [req.params.cartId]);
+            await pool.query('DELETE FROM shopping_cart WHERE cart_id = ?', [req.params.cartId]);
         } else {
             // 更新数量
-            await pool.query('UPDATE shopcar SET quantity = ? WHERE carid = ?', [quantity, req.params.cartId]);
+            await pool.query('UPDATE shopping_cart SET quantity = ? WHERE cart_id = ?', [quantity, req.params.cartId]);
         }
         res.json({ success: true, message: '数量已更新' });
     } catch (error) {
@@ -87,35 +88,35 @@ app.get('/api/books', async (req, res) => {
     const category = req.query.category;
 
     try {
-        // 🌟 核心修复 1：加上 stock >= 0 的条件。如果库存被设为 -1，说明被软删除了，不再显示！
-        let baseSql = ` FROM book WHERE stock >= 0 `;
+        // 🌟 核心修复 1：加上 stock >= 0 的条件。结合连表查询获取 category_name
+        let baseSql = ` FROM book b LEFT JOIN category c ON b.category_id = c.category_id WHERE b.stock >= 0 `;
         let params = [];
 
         if (keyword) {
-            baseSql += ` AND (bookname LIKE ? OR author LIKE ?)`;
+            baseSql += ` AND (b.book_name LIKE ? OR b.author LIKE ?)`;
             params.push(`%${keyword}%`, `%${keyword}%`);
         }
 
         if (category && category !== 'All') {
-            baseSql += ` AND categoryname = ?`;
+            baseSql += ` AND c.category_name = ?`;
             params.push(category);
         }
 
         const [countResult] = await pool.query(`SELECT COUNT(*) as total ${baseSql}`, params);
         const total = countResult[0].total;
 
-        // 🌟 核心修复 2：把 50 AS stock 换成真实的 stock！
+        // 🌟 核心修复 2：更新字段名，依然输出前端需要的别名
         const dataSql = `
             SELECT 
-                bookid AS book_id, 
-                bookname AS book_name, 
-                author, 
-                isbn, 
-                categoryname AS category_name, 
-                quality, 
-                price, 
-                stock     -- 👈 这里不再写死 50，直接读取真实库存
-            ${baseSql} ORDER BY bookid DESC LIMIT ? OFFSET ?
+                b.book_id AS book_id, 
+                b.book_name AS book_name, 
+                b.author, 
+                b.isbn, 
+                c.category_name AS category_name, 
+                b.quality, 
+                b.price, 
+                b.stock     -- 👈 这里不再写死 50，直接读取真实库存
+            ${baseSql} ORDER BY b.book_id DESC LIMIT ? OFFSET ?
         `;
         const [rows] = await pool.query(dataSql, [...params, limit, offset]);
 
@@ -140,22 +141,22 @@ app.post('/api/cart', async (req, res) => {
     const { consumer_id, book_id } = req.body;
 
     try {
-        // 🚨 修正1：表名改为 shopcar，字段名改为 consumerid, bookid, carid
+        // 🚨 修正1：表名改为 shopping_cart，字段名对齐新库
         const [exist] = await pool.query(
-            'SELECT carid FROM shopcar WHERE consumerid = ? AND bookid = ?',
+            'SELECT cart_id FROM shopping_cart WHERE consumer_id = ? AND book_id = ?',
             [consumer_id, book_id]
         );
 
         if (exist.length > 0) {
-            // 如果已经有了，数量直接 +1 (⚠️ 前提是你在 Navicat 的 shopcar 表里加上了 quantity 字段)
+            // 如果已经有了，数量直接 +1
             await pool.query(
-                'UPDATE shopcar SET quantity = quantity + 1 WHERE carid = ?',
-                [exist[0].carid]
+                'UPDATE shopping_cart SET quantity = quantity + 1 WHERE cart_id = ?',
+                [exist[0].cart_id]
             );
         } else {
-            // 🚨 修正2：往 shopcar 表里插入数据，严格匹配数据库列名
+            // 🚨 修正2：往 shopping_cart 表里插入数据
             await pool.query(
-                'INSERT INTO shopcar (consumerid, bookid, quantity) VALUES (?, ?, 1)',
+                'INSERT INTO shopping_cart (consumer_id, book_id, quantity) VALUES (?, ?, 1)',
                 [consumer_id, book_id]
             );
         }
@@ -178,12 +179,12 @@ app.post('/api/checkout', async (req, res) => {
     try {
         await connection.beginTransaction();
 
-        // 🚨 修正1：查用户信息，字段为 consumerid 和 vip
+        // 🚨 修正1：查用户信息，字段对齐新表 consumer_id 和 vip_level
         const [user] = await connection.query(
-            'SELECT vip FROM consumer WHERE consumerid = ?',
+            'SELECT vip_level FROM consumer WHERE consumer_id = ?',
             [consumer_id]
         );
-        const level = user[0]?.vip || 0;
+        const level = user[0]?.vip_level || 0;
 
         // 折扣逻辑不变
         let discountRate = 1.0;
@@ -191,12 +192,12 @@ app.post('/api/checkout', async (req, res) => {
         else if (level === 2) discountRate = 0.90; // 金卡 90折
         else if (level === 3) discountRate = 0.85; // 钻石 85折
 
-        // 🚨 修正2：查购物车，表名为 shopcar，字段为 consumerid, bookid
+        // 🚨 修正2：查购物车，表名为 shopping_cart，字段为 consumer_id, book_id
         const [cartItems] = await connection.query(`
-            SELECT sc.bookid AS book_id, sc.quantity, b.price
-            FROM shopcar sc
-                     JOIN book b ON sc.bookid = b.bookid
-            WHERE sc.consumerid = ?
+            SELECT sc.book_id, sc.quantity, b.price
+            FROM shopping_cart sc
+                     JOIN book b ON sc.book_id = b.book_id
+            WHERE sc.consumer_id = ?
         `, [consumer_id]);
 
         if (cartItems.length === 0) throw new Error('购物车为空');
@@ -206,30 +207,30 @@ app.post('/api/checkout', async (req, res) => {
         let discountedPrice = subtotal * discountRate;
         let totalPrice = discountedPrice + 10; // 加运费
 
-        // 🚨 修正3：写入 sale 表，严格匹配 Navicat 的字段名，并自动写入当前时间 NOW()
+        // 🚨 修正3：写入 sale 表，严格匹配新表字段名 payment_status, delivery_status 等
         const [saleResult] = await connection.query(`
-            INSERT INTO sale (consumerid, totalprice, payprice, ifpay, statu, order_time)
-            VALUES (?, ?, ?, '已支付', '未发货', NOW()) 
+            INSERT INTO sale (consumer_id, total_price, paid_amount, payment_status, delivery_status, order_time)
+            VALUES (?, ?, ?, '已支付', '未发货', NOW())
         `, [consumer_id, totalPrice, discountedPrice]);
 
         const saleId = saleResult.insertId;
 
-        // 🚨 修正4：写入 detail 表，并真正执行扣除库存
+        // 🚨 修正4：写入 detail 表，字段改为 quantity，并加上新表必填的 unit_price
         for (const item of cartItems) {
             await connection.query(`
-                INSERT INTO detail (saleid, bookid, quality)
-                VALUES (?, ?, ?)
-            `, [saleId, item.book_id, item.quantity]);
+                INSERT INTO detail (sale_id, book_id, quantity, unit_price)
+                VALUES (?, ?, ?, ?)
+            `, [saleId, item.book_id, item.quantity, item.price]);
 
-            // 🌟 解除封印：这句 SQL 终于可以真正扣除库存了！
+            // 🌟 正常执行扣除库存
             await connection.query(
-                'UPDATE book SET stock = stock - ? WHERE bookid = ?',
+                'UPDATE book SET stock = stock - ? WHERE book_id = ?',
                 [item.quantity, item.book_id]
             );
         }
 
-        // 🚨 修正5：清空购物车，表名为 shopcar
-        await connection.query('DELETE FROM shopcar WHERE consumerid = ?', [consumer_id]);
+        // 🚨 修正5：清空购物车，表名为 shopping_cart
+        await connection.query('DELETE FROM shopping_cart WHERE consumer_id = ?', [consumer_id]);
 
         await connection.commit();
         res.json({ success: true, message: `结算成功！会员等级：${level}，已享${discountRate * 10}折` });
@@ -249,22 +250,21 @@ app.post('/api/checkout', async (req, res) => {
 app.post('/api/login', async (req, res) => {
     const { username, password, role } = req.body;
     try {
-        // 修正：管理员表名叫 adm
-        let table = role === 'admin' ? 'adm' : 'consumer';
-        let nameField = role === 'admin' ? 'admname' : 'consumername';
-        let passField = role === 'admin' ? 'admpass' : 'consumerpass';
+        // 🚨 修正：新表管理员叫 admin，字段名统一为带下划线格式
+        let table = role === 'admin' ? 'admin' : 'consumer';
+        let nameField = role === 'admin' ? 'admin_name' : 'consumer_name';
+        let passField = role === 'admin' ? 'admin_pass' : 'consumer_pass';
 
         const sql = `SELECT * FROM ${table} WHERE ${nameField} = ? AND ${passField} = ?`;
         const [rows] = await pool.query(sql, [username, password]);
 
         if (rows.length > 0) {
             const user = rows[0];
-            const idField = role === 'admin' ? 'admid' : 'consumerid';
-            const nameValue = role === 'admin' ? 'admname' : 'consumername';
+            const idField = role === 'admin' ? 'admin_id' : 'consumer_id';
 
             res.json({
                 success: true,
-                user: { id: user[idField], name: user[nameValue], role: role }
+                user: { id: user[idField], name: user[nameField], role: role }
             });
         } else {
             res.status(401).json({ success: false, message: '账号或密码错误' });
@@ -274,7 +274,6 @@ app.post('/api/login', async (req, res) => {
     }
 });
 
-// ====== 在 server.js 里面追加这段 ======
 
 // 📚 Admin: 上架新书 (POST) - 唯一正确版
 app.post('/api/admin/books', async (req, res) => {
@@ -282,7 +281,9 @@ app.post('/api/admin/books', async (req, res) => {
     const { book_name, author, isbn, price, stock, category_id } = req.body;
 
     try {
-        // 🚨 核心修复 1：前端传的是 category_id，我们需要去 categories 表里把它“翻译”成文字
+        // 🚨 核心修复 1：你的新 book 表直接存 category_id 即可，不需要再翻译成文字了！
+        // ⚠️ 保证不删你的代码，我把你原来这段翻译逻辑注释掉了，留作备份纪念：
+        /*
         let catName = '综合';
         if (category_id) {
             const [cats] = await pool.query('SELECT category_name FROM categories WHERE category_id = ?', [category_id]);
@@ -292,10 +293,11 @@ app.post('/api/admin/books', async (req, res) => {
                 catName = category_id; // 兜底：万一前端传的就是文字，直接用
             }
         }
+        */
 
-        // 🚨 核心修复 2：严格对齐 book 表的字段 (bookname, categoryname, stock 等)
+        // 🚨 核心修复 2：严格对齐新 book 表的字段 (book_name, category_id 等)
         await pool.query(
-            'INSERT INTO book (bookname, author, isbn, price, stock, quality, categoryname) VALUES (?, ?, ?, ?, ?, ?, ?)',
+            'INSERT INTO book (book_name, author, isbn, price, stock, quality, category_id) VALUES (?, ?, ?, ?, ?, ?, ?)',
             [
                 book_name,
                 author || '佚名',               // 兜底：前端没传作者，就填'佚名'
@@ -303,7 +305,7 @@ app.post('/api/admin/books', async (req, res) => {
                 price || 0,
                 stock || 0,
                 '全新',                         // 兜底：默认新书
-                catName                         // 插入翻译好的文字分类名
+                category_id || 1                // 👈 直接存入数字 ID
             ]
         );
         res.json({ success: true, message: '新书上架成功！' });
@@ -312,17 +314,19 @@ app.post('/api/admin/books', async (req, res) => {
         res.status(500).json({ success: false, message: '服务器异常' });
     }
 });
+
 // 📚 Admin: 终极删除/下架图书 (唯一正确版，全场只能有这一个)
 app.delete('/api/admin/books/:id', async (req, res) => {
     const bookId = req.params.id;
     try {
-        await pool.query('DELETE FROM shopcar WHERE bookid = ?', [bookId]);
-        await pool.query('DELETE FROM book WHERE bookid = ?', [bookId]);
+        // 🚨 修正表名和字段：shopcar -> shopping_cart，bookid -> book_id
+        await pool.query('DELETE FROM shopping_cart WHERE book_id = ?', [bookId]);
+        await pool.query('DELETE FROM book WHERE book_id = ?', [bookId]);
         res.json({ success: true, message: '书籍彻底物理删除成功！' });
     } catch (error) {
-        // 🌟 核心修复 3：把库存设为 -1，当作“已下架/已删除”的标记
+        // 🌟 核心修复 3：把库存设为 -1，当作“已下架/已删除”的标记 (bookid 改为 book_id)
         try {
-            await pool.query('UPDATE book SET stock = -1 WHERE bookid = ?', [bookId]);
+            await pool.query('UPDATE book SET stock = -1 WHERE book_id = ?', [bookId]);
             res.json({ success: true, message: '该书有交易记录，已转为软下架隐藏！' });
         } catch (err2) {
             res.status(500).json({ success: false, message: '服务器彻底罢工了' });
@@ -338,10 +342,10 @@ app.put('/api/admin/books/:id', async (req, res) => {
     const { book_name, author, price, stock } = req.body;
 
     try {
-        // 🚨 核心修复：SQL 语句里的列名必须完全等于 Navicat 里的名字 (bookname, bookid)
+        // 🚨 核心修复：SQL 语句里的列名必须完全等于 Navicat 里的新名字 (book_name, book_id)
         // 并且去掉了不存在的 category_id
         await pool.query(
-            'UPDATE book SET bookname = ?, author = ?, price = ?, stock = ? WHERE bookid = ?',
+            'UPDATE book SET book_name = ?, author = ?, price = ?, stock = ? WHERE book_id = ?',
             [book_name, author || '', price, stock, req.params.id]
         );
         res.json({ success: true, message: '图书修改成功！' });
@@ -358,14 +362,16 @@ app.put('/api/admin/books/:id', async (req, res) => {
 app.post('/api/register', async (req, res) => {
     const { username, password, email } = req.body; // 🚨 剔除前端传来的 phone
     try {
-        const [exist] = await pool.query('SELECT * FROM consumer WHERE consumername = ?', [username]);
+        // 🚨 修正查询字段：consumername -> consumer_name
+        const [exist] = await pool.query('SELECT * FROM consumer WHERE consumer_name = ?', [username]);
         if (exist.length > 0) {
             return res.status(400).json({ success: false, message: '该用户名已被注册，请换一个' });
         }
 
-        // 🚨 严格对齐字段名：consumername, consumerpass, vip
+        // 🚨 严格对齐字段名：consumer_name, consumer_pass, vip_level
+        // ⚠️ 新表删除了 balance，所以我在这里把它从 INSERT 语句里拿掉了
         const [result] = await pool.query(
-            'INSERT INTO consumer (consumername, consumerpass, email, vip, integral, balance, register_time) VALUES (?, ?, ?, 0, 0, 0, NOW())',
+            'INSERT INTO consumer (consumer_name, consumer_pass, email, vip_level, integral, register_time) VALUES (?, ?, ?, 0, 0, NOW())',
             [username, password, email]
         );
 
@@ -383,9 +389,9 @@ app.post('/api/register', async (req, res) => {
 // 18. 获取所有分类字典
 app.get('/api/categories', async (req, res) => {
     try {
-        // 🌟 核心修复：根据你的 Navicat 截图，表名是 categories（带s）
-        // 并且字段名必须严格匹配 category_id 和 category_name
-        const [rows] = await pool.query('SELECT category_id, category_name FROM categories');
+        // 🌟 核心修复：根据你的 Navicat 截图，新表名是 category（不带s了）
+        // 并且字段名严格匹配 category_id 和 category_name
+        const [rows] = await pool.query('SELECT category_id, category_name FROM category');
 
         res.json({ success: true, data: rows });
     } catch (error) {
@@ -402,7 +408,7 @@ app.get('/api/categories', async (req, res) => {
 // 2. 获取某个客户的收货地址簿
 app.get('/api/admin/consumers/:id/addresses', async (req, res) => {
     try {
-        // 根据 consumer_id 去 address 表里查地址
+        // 根据 consumer_id 去 address 表里查地址 (字段已是对的)
         const [rows] = await pool.query('SELECT * FROM address WHERE consumer_id = ? ORDER BY is_default DESC', [req.params.id]);
         res.json({ success: true, data: rows });
     } catch (error) {
@@ -413,15 +419,17 @@ app.get('/api/admin/consumers/:id/addresses', async (req, res) => {
 
 // 3. 修改客户信息
 app.put('/api/admin/consumers/:id', async (req, res) => {
-    const { consumer_name, email, vip_level, integral, balance } = req.body; // 去掉 phone
+    // 去掉 phone，且因为新表移除了 balance 字段，这里我们接收它但不存入数据库
+    const { consumer_name, email, vip_level, integral, balance } = req.body;
     try {
-        // 🚨 严格对齐：consumername, vip, consumerid
+        // 🚨 严格对齐新表字段：consumer_name, vip_level, consumer_id
+        // ⚠️ 移除了旧表的 balance
         const sql = `
             UPDATE consumer
-            SET consumername = ?, email = ?, vip = ?, integral = ?, balance = ?
-            WHERE consumerid = ?
+            SET consumer_name = ?, email = ?, vip_level = ?, integral = ?
+            WHERE consumer_id = ?
         `;
-        await pool.query(sql, [consumer_name, email, vip_level, integral, balance, req.params.id]);
+        await pool.query(sql, [consumer_name, email, vip_level, integral, req.params.id]);
         res.json({ success: true, message: '客户资料已更新' });
     } catch (error) {
         console.error('修改客户资料失败:', error.message);
@@ -433,12 +441,12 @@ app.put('/api/admin/consumers/:id', async (req, res) => {
 app.delete('/api/admin/consumers/:id', async (req, res) => {
     const userId = req.params.id;
     try {
-        // 🚨 严格对齐：saleid, consumerid
-        const [orders] = await pool.query('SELECT saleid FROM sale WHERE consumerid = ?', [userId]);
+        // 🚨 严格对齐新表字段：sale_id, consumer_id
+        const [orders] = await pool.query('SELECT sale_id FROM sale WHERE consumer_id = ?', [userId]);
         if (orders.length > 0) {
             return res.status(400).json({ success: false, message: '该客户存在历史订单记录，无法注销' });
         }
-        await pool.query('DELETE FROM consumer WHERE consumerid = ?', [userId]);
+        await pool.query('DELETE FROM consumer WHERE consumer_id = ?', [userId]);
         res.json({ success: true, message: '客户账号已成功注销' });
     } catch (error) {
         console.error('注销客户失败:', error.message);
@@ -453,17 +461,18 @@ app.delete('/api/admin/consumers/:id', async (req, res) => {
 // 1. 获取订单列表 (修复 Invalid Date 和状态丢失)
 app.get('/api/admin/orders', async (req, res) => {
     try {
+        // 🚨 修正：全面对齐 sale 表和 consumer 表的新字段名，但依然通过 AS 映射给前端
         const sql = `
             SELECT
-                s.saleid AS sale_id,
-                s.totalprice AS total_price,
-                s.ifpay AS payment_status,
-                s.statu AS delivery_status,
+                s.sale_id AS sale_id,
+                s.total_price AS total_price,
+                s.payment_status AS payment_status,
+                s.delivery_status AS delivery_status,
                 s.order_time AS order_time,
-                c.consumername AS consumer_name
+                c.consumer_name AS consumer_name
             FROM sale s
-                     JOIN consumer c ON s.consumerid = c.consumerid
-            ORDER BY s.saleid DESC
+                     JOIN consumer c ON s.consumer_id = c.consumer_id
+            ORDER BY s.sale_id DESC
         `;
         const [rows] = await pool.query(sql);
         res.json({ success: true, data: rows || [] });
@@ -476,17 +485,19 @@ app.get('/api/admin/orders', async (req, res) => {
 // 2. 获取订单明细 (修复无限 Loading)
 app.get('/api/admin/orders/:id/details', async (req, res) => {
     try {
+        // 🚨 修正：新表 detail 终于有了正规的 quantity (数量) 和 unit_price (单价) 字段了！
+        // 告别原来用 quality 代替数量的奇葩历史
         const sql = `
-            SELECT 
-                d.detailid AS detail_id, 
-                d.bookid AS book_id, 
-                d.quality AS quantity,   -- 🚨 数据库存数量的字段叫 quality
-                b.price AS unit_price,   -- 从 book 表联查单价
-                b.bookname AS book_name, 
+            SELECT
+                d.detail_id AS detail_id,
+                d.book_id AS book_id,
+                d.quantity AS quantity,   -- 🌟 正规化后的数量字段
+                d.unit_price AS unit_price, -- 🌟 正规化后的单价字段
+                b.book_name AS book_name,
                 b.author
             FROM detail d
-            JOIN book b ON d.bookid = b.bookid
-            WHERE d.saleid = ?
+                     JOIN book b ON d.book_id = b.book_id
+            WHERE d.sale_id = ?
         `;
         const [rows] = await pool.query(sql, [req.params.id]);
         res.json({ success: true, data: rows });
@@ -503,16 +514,16 @@ app.delete('/api/admin/orders/:id', async (req, res) => {
     try {
         await connection.beginTransaction();
 
-        // 🌟 新增逻辑：在删除明细之前，先把这些书的库存“还”回去
-        const [items] = await connection.query('SELECT bookid, quality FROM detail WHERE saleid = ?', [saleId]);
+        // 🌟 修正：从 detail 取出真正的 quantity (而不是 quality)，并对齐 book_id, sale_id
+        const [items] = await connection.query('SELECT book_id, quantity FROM detail WHERE sale_id = ?', [saleId]);
         for (let item of items) {
-            // quality 就是你表里的数量，把它加回 stock 里
-            await connection.query('UPDATE book SET stock = stock + ? WHERE bookid = ?', [item.quality, item.bookid]);
+            // 将 quantity 加回 stock 里
+            await connection.query('UPDATE book SET stock = stock + ? WHERE book_id = ?', [item.quantity, item.book_id]);
         }
 
-        // 退完库存后，正常删除明细和主订单
-        await connection.query('DELETE FROM detail WHERE saleid = ?', [saleId]);
-        await connection.query('DELETE FROM sale WHERE saleid = ?', [saleId]);
+        // 退完库存后，正常删除明细和主订单 (修正 sale_id)
+        await connection.query('DELETE FROM detail WHERE sale_id = ?', [saleId]);
+        await connection.query('DELETE FROM sale WHERE sale_id = ?', [saleId]);
 
         await connection.commit();
         res.json({ success: true, message: '订单已删除，库存已成功退回仓库！' });
@@ -528,7 +539,8 @@ app.delete('/api/admin/orders/:id', async (req, res) => {
 // 4. 订单发货 (前端调用的是 /dispatch 路径)
 app.put('/api/admin/orders/:id/dispatch', async (req, res) => {
     try {
-        await pool.query("UPDATE sale SET statu = '已发货' WHERE saleid = ?", [req.params.id]);
+        // 🚨 修正：statu -> delivery_status，saleid -> sale_id
+        await pool.query("UPDATE sale SET delivery_status = '已发货' WHERE sale_id = ?", [req.params.id]);
         res.json({ success: true, message: '发货成功！' });
     } catch (error) {
         console.error('发货失败:', error.message);
@@ -541,10 +553,11 @@ app.put('/api/admin/orders/:id', async (req, res) => {
     // 忽略数据库没有的地址和支付方式，只更新时间和状态
     const { order_time, delivery_status, payment_status } = req.body;
     try {
+        // 🚨 修正：statu -> delivery_status, ifpay -> payment_status, saleid -> sale_id
         const sql = `
-            UPDATE sale 
-            SET order_time = ?, statu = ?, ifpay = ? 
-            WHERE saleid = ?
+            UPDATE sale
+            SET order_time = ?, delivery_status = ?, payment_status = ?
+            WHERE sale_id = ?
         `;
         await pool.query(sql, [order_time, delivery_status, payment_status, req.params.id]);
         res.json({ success: true, message: '订单基础信息已更新' });
@@ -563,21 +576,22 @@ app.put('/api/admin/orders/:saleId/details/:detailId', async (req, res) => {
     try {
         await connection.beginTransaction();
 
-        // 更新 detail 表的 quantity (数据库里叫 quality)
-        await connection.query('UPDATE detail SET quality = ? WHERE detailid = ?', [quantity, detailId]);
+        // 🚨 修正：彻底告别 quality！新表使用正常的 quantity 字段，主键为 detail_id
+        await connection.query('UPDATE detail SET quantity = ? WHERE detail_id = ?', [quantity, detailId]);
 
         // 重新计算该订单的总价: SUM(数量 * 书本单价)
+        // 🚨 修正：联表查询的关联字段全部替换为 book_id, sale_id
         const [allDetails] = await connection.query(`
-            SELECT SUM(d.quality * b.price) as subtotal 
+            SELECT SUM(d.quantity * b.price) as subtotal
             FROM detail d
-            JOIN book b ON d.bookid = b.bookid
-            WHERE d.saleid = ?
+                     JOIN book b ON d.book_id = b.book_id
+            WHERE d.sale_id = ?
         `, [saleId]);
 
         const newTotal = (allDetails[0].subtotal || 0) + 10; // 加上 10 元运费
 
-        // 更新 sale 表的 totalprice
-        await connection.query('UPDATE sale SET totalprice = ? WHERE saleid = ?', [newTotal, saleId]);
+        // 🚨 修正：totalprice -> total_price, saleid -> sale_id
+        await connection.query('UPDATE sale SET total_price = ? WHERE sale_id = ?', [newTotal, saleId]);
 
         await connection.commit();
         res.json({ success: true, newTotal });
@@ -595,12 +609,13 @@ app.put('/api/admin/orders/:saleId/details/:detailId', async (req, res) => {
 // ==========================================
 // 👤 C端用户：个人中心接口 (User Profile)
 // ==========================================
-// 1. 获取用户的个人档案 (使用 AS 映射)
+// 1. 获取用户的个人档案
 app.get('/api/users/:id/profile', async (req, res) => {
     try {
+        // 🚨 修正：新表已经全部是标准下划线字段，直接查即可。移除已被淘汰的 balance 字段。
         const [rows] = await pool.query(`
-            SELECT consumerid AS consumer_id, consumername AS consumer_name, email, vip AS vip_level, integral, balance 
-            FROM consumer WHERE consumerid = ?
+            SELECT consumer_id, consumer_name, email, vip_level, integral
+            FROM consumer WHERE consumer_id = ?
         `, [req.params.id]);
 
         if (rows.length > 0) {
@@ -618,8 +633,9 @@ app.get('/api/users/:id/profile', async (req, res) => {
 app.put('/api/users/:id/profile', async (req, res) => {
     const { consumer_name, email } = req.body; // 不要接收 phone，因为数据库没这个列
     try {
+        // 🚨 修正：consumername -> consumer_name, consumerid -> consumer_id
         await pool.query(
-            'UPDATE consumer SET consumername = ?, email = ? WHERE consumerid = ?',
+            'UPDATE consumer SET consumer_name = ?, email = ? WHERE consumer_id = ?',
             [consumer_name, email, req.params.id]
         );
         res.json({ success: true, message: '个人资料更新成功' });
@@ -637,6 +653,7 @@ app.put('/api/users/:id/profile', async (req, res) => {
 app.get('/api/users/:id/addresses', async (req, res) => {
     try {
         // 查自己的地址，并把默认地址 (is_default = 1) 排在最前面
+        // 🌟 你的新 address 表本身就非常规范，这句 SQL 完美匹配！
         const [rows] = await pool.query('SELECT * FROM address WHERE consumer_id = ? ORDER BY is_default DESC, address_id DESC', [req.params.id]);
         res.json({ success: true, data: rows });
     } catch (error) {
@@ -669,20 +686,19 @@ app.put('/api/users/:id/addresses/:addressId/default', async (req, res) => {
     }
 });
 
-
 // ==========================================
 // 📊 管理员数据大盘接口 (Executive Dashboard) - 终极稳健版
 // ==========================================
 
 app.get('/api/admin/dashboard/stats', async (req, res) => {
     try {
-        // 今日营收：使用 totalprice 和 ifpay
-        const [todayRev] = await pool.query(`SELECT SUM(totalprice) AS rev FROM sale WHERE DATE(order_time) = CURDATE() AND ifpay = '已支付'`);
-        // 今日销量：注意这里把 quantity 改成了你表里的 quality
-        const [todayQty] = await pool.query(`SELECT SUM(d.quality) AS qty FROM sale s JOIN detail d ON s.saleid = d.saleid WHERE DATE(s.order_time) = CURDATE() AND s.ifpay = '已支付'`);
+        // 🚨 修正：totalprice -> total_price, ifpay -> payment_status
+        const [todayRev] = await pool.query(`SELECT SUM(total_price) AS rev FROM sale WHERE DATE(order_time) = CURDATE() AND payment_status = '已支付'`);
+        // 🚨 修正：d.quality -> d.quantity, saleid -> sale_id
+        const [todayQty] = await pool.query(`SELECT SUM(d.quantity) AS qty FROM sale s JOIN detail d ON s.sale_id = d.sale_id WHERE DATE(s.order_time) = CURDATE() AND s.payment_status = '已支付'`);
 
-        const [monthRev] = await pool.query(`SELECT SUM(totalprice) AS rev FROM sale WHERE YEAR(order_time) = YEAR(CURDATE()) AND MONTH(order_time) = MONTH(CURDATE()) AND ifpay = '已支付'`);
-        const [monthQty] = await pool.query(`SELECT SUM(d.quality) AS qty FROM sale s JOIN detail d ON s.saleid = d.saleid WHERE YEAR(s.order_time) = YEAR(CURDATE()) AND MONTH(s.order_time) = MONTH(CURDATE()) AND s.ifpay = '已支付'`);
+        const [monthRev] = await pool.query(`SELECT SUM(total_price) AS rev FROM sale WHERE YEAR(order_time) = YEAR(CURDATE()) AND MONTH(order_time) = MONTH(CURDATE()) AND payment_status = '已支付'`);
+        const [monthQty] = await pool.query(`SELECT SUM(d.quantity) AS qty FROM sale s JOIN detail d ON s.sale_id = d.sale_id WHERE YEAR(s.order_time) = YEAR(CURDATE()) AND MONTH(s.order_time) = MONTH(CURDATE()) AND s.payment_status = '已支付'`);
 
         const [users] = await pool.query('SELECT COUNT(*) AS total FROM consumer');
         const [books] = await pool.query('SELECT COUNT(*) AS total FROM book');
@@ -704,10 +720,11 @@ app.get('/api/admin/dashboard/stats', async (req, res) => {
     }
 });
 
-// 19. 获取库存预警列表 (映射正确的 bookid 和 bookname)
+// 19. 获取库存预警列表 (映射正确的 book_id 和 book_name)
 app.get('/api/admin/inventory/warning', async (req, res) => {
     try {
-        const [rows] = await pool.query('SELECT bookid AS book_id, bookname AS book_name, stock FROM book WHERE stock < 5 ORDER BY stock ASC');
+        // 🚨 修正：bookid -> book_id, bookname -> book_name
+        const [rows] = await pool.query('SELECT book_id, book_name, stock FROM book WHERE stock < 5 ORDER BY stock ASC');
         res.json({ success: true, data: rows });
     } catch (error) {
         console.error('获取库存预警失败:', error.message);
@@ -715,17 +732,19 @@ app.get('/api/admin/inventory/warning', async (req, res) => {
     }
 });
 
-
 app.get('/api/admin/analysis/category', async (req, res) => {
     try {
+        // 🚨 修正：book 表不再有 categoryname，改用连表 category 查询 category_name
+        // 并把 d.quality 修正为真正的 d.quantity
         const sql = `
             SELECT
-                b.categoryname as category,
-                SUM(d.quality) as total_qty, -- 🌟 你的表里叫 quality
-                SUM(d.quality * b.price) as total_amount -- 🌟 销量乘以单价
+                c.category_name as category,
+                SUM(d.quantity) as total_qty,
+                SUM(d.quantity * b.price) as total_amount
             FROM detail d
-                     JOIN book b ON d.bookid = b.bookid -- 🌟 你的表里叫 bookid
-            GROUP BY b.categoryname
+                     JOIN book b ON d.book_id = b.book_id
+                     LEFT JOIN category c ON b.category_id = c.category_id
+            GROUP BY c.category_name
             ORDER BY total_amount DESC
         `;
         const [rows] = await pool.query(sql);
@@ -738,21 +757,23 @@ app.get('/api/admin/analysis/category', async (req, res) => {
 
 app.get('/api/admin/analysis/vip', async (req, res) => {
     try {
+        // 🚨 修正：vip -> vip_level, consumerid -> consumer_id, totalprice -> total_price
+        // ⚠️ 新表删除了 balance 字段，这里我们改成统计平均积分 (integral)，前端变量名暂不改变以防报错
         const sql = `
             SELECT
-                c.vip as vip_level,
-                COUNT(DISTINCT c.consumerid) as user_count,
-                SUM(s.totalprice) as total_revenue,
-                AVG(c.balance) as avg_balance
+                c.vip_level as vip_level,
+                COUNT(DISTINCT c.consumer_id) as user_count,
+                SUM(s.total_price) as total_revenue,
+                AVG(c.integral) as avg_balance
             FROM consumer c
-                     LEFT JOIN sale s ON c.consumerid = s.consumerid
-            GROUP BY c.vip
+                     LEFT JOIN sale s ON c.consumer_id = s.consumer_id
+            GROUP BY c.vip_level
             ORDER BY user_count DESC
         `;
         const [rows] = await pool.query(sql);
         res.json({ success: true, data: rows });
     } catch (error) {
-        console.error('会员分析报错:', error);
+        console.error('会员分析报错:', error.message);
         res.status(500).json({ success: false, message: error.message });
     }
 });
@@ -762,31 +783,30 @@ app.get('/api/orders/user/:userId', async (req, res) => {
     try {
         const userId = req.params.userId;
 
-        // 🚨 修正1：严格匹配 sale 表的真实字段（saleid, totalprice, ifpay, statu, consumerid, order_time）
-        // 然后用 AS 翻译成前端需要的变量名
+        // 🚨 修正1：严格匹配 sale 表的新字段名，AS 后面保留前端需要的变量名
         const [orders] = await pool.query(`
             SELECT
-                saleid AS sale_id,
-                totalprice AS total_price,
-                ifpay AS payment_status,
-                statu AS delivery_status,
+                sale_id AS sale_id,
+                total_price AS total_price,
+                payment_status AS payment_status,
+                delivery_status AS delivery_status,
                 order_time AS created_at
             FROM sale
-            WHERE consumerid = ?
-            ORDER BY saleid DESC
+            WHERE consumer_id = ?
+            ORDER BY sale_id DESC
         `, [userId]);
 
-        // 🚨 修正2：循环查询订单明细，严格匹配 detail 和 book 表的真实字段
+        // 🚨 修正2：循环查询订单明细，对齐新表 detail 的 quantity 和 book 的 book_id / book_name
         for (let order of orders) {
             const [details] = await pool.query(`
                 SELECT
-                    d.quality AS quantity,   -- 你的明细表里存数量的字段叫 quality
-                    b.price AS unit_price,   -- 从 book 表里拿单价
-                    b.bookname AS book_name,
-                    b.bookid AS book_id
+                    d.quantity AS quantity,
+                    b.price AS unit_price,
+                    b.book_name AS book_name,
+                    b.book_id AS book_id
                 FROM detail d
-                         JOIN book b ON d.bookid = b.bookid
-                WHERE d.saleid = ?
+                         JOIN book b ON d.book_id = b.book_id
+                WHERE d.sale_id = ?
             `, [order.sale_id]);
 
             order.items = details; // 把查出来的明细塞进订单里返回给前端
@@ -794,7 +814,7 @@ app.get('/api/orders/user/:userId', async (req, res) => {
 
         res.json({ success: true, data: orders });
     } catch (error) {
-        console.error('获取历史订单崩溃:', error.message); // 打印红字方便排错
+        console.error('获取历史订单崩溃:', error.message);
         res.status(500).json({ success: false, message: 'Server error' });
     }
 });
@@ -802,15 +822,37 @@ app.get('/api/orders/user/:userId', async (req, res) => {
 // 1. 获取所有客户列表 (Admin端专用)
 app.get('/api/admin/consumers', async (req, res) => {
     try {
-        // 🌟 核心修正：使用 AS 将数据库字段映射为前端期望的名称
+        // 🌟 核心修正：对齐新的 consumer 表字段，剔除不存在的 balance 字段
         const sql = `
             SELECT
-                consumerid AS consumer_id,
-                consumername AS consumer_name,
+                consumer_id AS consumer_id,
+                consumer_name AS consumer_name,
                 email,
-                vip AS vip_level,
+                vip_level AS vip_level,
                 integral,
-                balance,
+                register_time
+            FROM consumer
+            ORDER BY register_time DESC
+        `;
+        const [rows] = await pool.query(sql);
+        res.json({ success: true, data: rows });
+    } catch (error) {
+        console.error('获取客户列表失败:', error.message);
+        res.status(500).json({ success: false, message: '服务器异常' });
+    }
+});
+
+// 1. 获取所有客户列表 (Admin端专用)
+app.get('/api/admin/consumers', async (req, res) => {
+    try {
+        // 🌟 核心修正：对齐新的 consumer 表字段，剔除不存在的 balance 字段
+        const sql = `
+            SELECT
+                consumer_id AS consumer_id,
+                consumer_name AS consumer_name,
+                email,
+                vip_level AS vip_level,
+                integral,
                 register_time
             FROM consumer
             ORDER BY register_time DESC
@@ -827,14 +869,14 @@ app.get('/api/admin/consumers', async (req, res) => {
 app.get('/api/admin/analysis/top-customers', async (req, res) => {
     try {
         const sql = `
-            SELECT 
-                c.consumername AS consumer_name, 
+            SELECT
+                c.consumername AS consumer_name,
                 SUM(s.totalprice) AS total_spent
             FROM sale s
-            JOIN consumer c ON s.consumerid = c.consumerid
+                     JOIN consumer c ON s.consumerid = c.consumerid
             GROUP BY c.consumerid, c.consumername
             ORDER BY total_spent DESC
-            LIMIT 5
+                LIMIT 5
         `;
         const [rows] = await pool.query(sql);
         res.json({ success: true, data: rows });
