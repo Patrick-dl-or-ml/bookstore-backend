@@ -78,7 +78,7 @@ app.put('/api/cart/:cartId', async (req, res) => {
     }
 });
 
-// 4. 获取图书列表 (适配你的数据库字段：quality, categoryname)
+// 4. 获取图书列表
 app.get('/api/books', async (req, res) => {
     const page = parseInt(req.query.page) || 1;
     const limit = parseInt(req.query.limit) || 12;
@@ -88,7 +88,6 @@ app.get('/api/books', async (req, res) => {
     const category = req.query.category;
 
     try {
-        // 🌟 核心修复 1：加上 stock >= 0 的条件。结合连表查询获取 category_name
         let baseSql = ` FROM book b LEFT JOIN category c ON b.category_id = c.category_id WHERE b.stock >= 0 `;
         let params = [];
 
@@ -105,7 +104,7 @@ app.get('/api/books', async (req, res) => {
         const [countResult] = await pool.query(`SELECT COUNT(*) as total ${baseSql}`, params);
         const total = countResult[0].total;
 
-        // 🌟 核心修复 2：更新字段名，依然输出前端需要的别名
+        // 🚨 核心修复：把漏掉的 publisher 和 description 加上！
         const dataSql = `
             SELECT 
                 b.book_id AS book_id, 
@@ -115,7 +114,9 @@ app.get('/api/books', async (req, res) => {
                 c.category_name AS category_name, 
                 b.quality, 
                 b.price, 
-                b.stock     -- 👈 这里不再写死 50，直接读取真实库存
+                b.stock,
+                b.publisher,    -- 🌟 补上出版社
+                b.description   -- 🌟 补上简介
             ${baseSql} ORDER BY b.book_id DESC LIMIT ? OFFSET ?
         `;
         const [rows] = await pool.query(dataSql, [...params, limit, offset]);
@@ -132,8 +133,6 @@ app.get('/api/books', async (req, res) => {
         res.status(500).json({ success: false, message: '服务器查询失败' });
     }
 });
-
-// ====== 在 server.js 里面追加这段 ======
 
 // 5. 加入购物车接口 (POST 请求)
 app.post('/api/cart', async (req, res) => {
